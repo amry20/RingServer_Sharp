@@ -1,0 +1,15 @@
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\RingServer.GeneratedMSBuildEditorConfig.editorconfig
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\RingServer.AssemblyInfoInputs.cache
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\RingServer.AssemblyInfo.cs
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\RingServer.csproj.CoreCompileInputs.cache
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\bin\Debug\net10.0\RingServer.exe
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\bin\Debug\net10.0\RingServer.deps.json
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\bin\Debug\net10.0\RingServer.runtimeconfig.json
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\bin\Debug\net10.0\RingServer.dll
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\bin\Debug\net10.0\RingServer.pdb
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\RingServer.dll
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\refint\RingServer.dll
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\RingServer.pdb
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\RingServer.genruntimeconfig.cache
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\ref\RingServer.dll
+D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\bin\Debug\net10.0\ring.conf
