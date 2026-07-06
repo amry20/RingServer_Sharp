@@ -13,3 +13,8 @@ D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingSer
 D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\RingServer.genruntimeconfig.cache
 D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\ref\RingServer.dll
 D:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\bin\Debug\net10.0\ring.conf
+d:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\RingServer.csproj.AssemblyReference.cache
+d:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\bin\Debug\net10.0\Microsoft.Extensions.DependencyInjection.Abstractions.dll
+d:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\bin\Debug\net10.0\Microsoft.Extensions.Logging.Abstractions.dll
+d:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\bin\Debug\net10.0\Npgsql.dll
+d:\National Seismic Instrument\Release\Software\RingServer_C#\RingServer\RingServer\obj\Debug\net10.0\RingServer.csproj.Up2Date
