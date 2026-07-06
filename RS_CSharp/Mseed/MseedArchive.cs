@@ -96,6 +96,9 @@ public class MseedArchive : IDisposable
         _batchIntervalMs = batchIntervalMs;
         _retentionDays = retentionDays;
 
+        // Ensure the target database exists (auto-create if missing)
+        EnsureDatabaseExists(connectionString);
+
         var builder = new NpgsqlDataSourceBuilder(connectionString);
         builder.ConnectionStringBuilder.Pooling = true;
         builder.ConnectionStringBuilder.MaxPoolSize = 50;
@@ -112,6 +115,72 @@ public class MseedArchive : IDisposable
 
         Logging.lprintf(1, "MseedArchive: initialized (batchSize={0}, interval={1}ms, retentionDays={2})",
             batchSize, batchIntervalMs, _retentionDays);
+    }
+
+    /// <summary>
+    /// Ensure the target PostgreSQL database exists. If not, create it automatically.
+    /// Connects to the 'postgres' maintenance database to issue CREATE DATABASE.
+    /// </summary>
+    private static void EnsureDatabaseExists(string connectionString)
+    {
+        // Parse the connection string to get Database name
+        var csb = new NpgsqlConnectionStringBuilder(connectionString);
+        string targetDb = csb.Database ?? "ringserver";
+
+        // Try connecting to the target database first
+        try
+        {
+            using var testConn = new NpgsqlConnection(connectionString);
+            testConn.Open();
+            testConn.Close();
+            Logging.lprintf(1, "Database '{0}' already exists", targetDb);
+            return;
+        }
+        catch (PostgresException ex) when (ex.SqlState == "3D000") // 3D000 = invalid_catalog_name (database doesn't exist)
+        {
+            Logging.lprintf(1, "Database '{0}' does not exist, creating...", targetDb);
+        }
+        catch (Exception ex)
+        {
+            // Other connection errors (wrong password, host down, etc.) — let the caller handle
+            Logging.lprintf(0, "Cannot connect to PostgreSQL: {0}", ex.Message);
+            throw;
+        }
+
+        // Connect to 'postgres' database to create the target database
+        var postgresCsb = new NpgsqlConnectionStringBuilder(connectionString)
+        {
+            Database = "postgres"
+        };
+
+        try
+        {
+            using var conn = new NpgsqlConnection(postgresCsb.ConnectionString);
+            conn.Open();
+
+            // Check if database already exists (double-check, race-condition safe)
+            using var checkCmd = new NpgsqlCommand(
+                $"SELECT 1 FROM pg_database WHERE datname = '{targetDb}'", conn);
+            var exists = checkCmd.ExecuteScalar() != null;
+
+            if (!exists)
+            {
+                // CREATE DATABASE cannot run inside a transaction block
+                using var createCmd = new NpgsqlCommand(
+                    $"CREATE DATABASE \"{targetDb}\"", conn);
+                createCmd.ExecuteNonQuery();
+                Logging.lprintf(0, "Created database '{0}'", targetDb);
+            }
+            else
+            {
+                Logging.lprintf(1, "Database '{0}' already exists", targetDb);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logging.lprintf(0, "Failed to create database '{0}': {1}", targetDb, ex.Message);
+            throw;
+        }
     }
 
     /// <summary>

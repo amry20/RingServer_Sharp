@@ -113,6 +113,15 @@ public static class Program
             Logging.lprintf(2, "Could not register Posix signals: {0}", ex.Message);
         }
 
+        // Resolve storage mode early — Sql mode forces volatile ring
+        var storageMode = ResolveStorageMode(config);
+        bool sqlMode = storageMode == StorageMode.Sql;
+        if (sqlMode)
+        {
+            config.VolatileRing = true;
+            Logging.lprintf(1, "Storage mode is Sql — ring buffer will be volatile (in-memory only)");
+        }
+
         // Initialize ring system
         if (!string.IsNullOrEmpty(config.RingDir) || config.VolatileRing)
         {
@@ -249,20 +258,35 @@ public static class Program
         // Store global ring parameters
         ServerConfig.RingParams = ringparams;
 
-        // Initialize PostgreSQL archive if configured
-        if (!string.IsNullOrEmpty(config.PostgresConnStr))
+        // Resolve storage mode
+        Logging.lprintf(1, "Storage mode resolved: {0}", storageMode);
+
+        // Initialize PostgreSQL archive if configured and storage mode is Sql or Auto+Sql
+        if (storageMode == StorageMode.Sql || storageMode == StorageMode.Auto)
         {
-            try
+            if (!string.IsNullOrEmpty(config.PostgresConnStr))
             {
-                ServerConfig.Archive = new MseedArchive(config.PostgresConnStr,
-                    retentionDays: config.PostgresRetentionDays);
-                Logging.lprintf(1, "PostgreSQL archive initialized");
+                try
+                {
+                    ServerConfig.Archive = new MseedArchive(config.PostgresConnStr,
+                        retentionDays: config.PostgresRetentionDays);
+                    Logging.lprintf(1, "PostgreSQL archive initialized (storage mode: {0})", storageMode);
+                }
+                catch (Exception ex)
+                {
+                    Logging.lprintf(0, "Failed to initialize PostgreSQL archive: {0}", ex.Message);
+                    if (storageMode == StorageMode.Sql)
+                    {
+                        Logging.lprintf(0, "Storage mode is Sql but PostgreSQL failed — exiting");
+                        return 1;
+                    }
+                    Logging.lprintf(0, "Falling back to file-only mode");
+                }
             }
-            catch (Exception ex)
+            else if (storageMode == StorageMode.Sql)
             {
-                Logging.lprintf(0, "Failed to initialize PostgreSQL archive: {0}", ex.Message);
-                Logging.lprintf(0, "Continuing without archive — miniSEED will NOT be persisted");
-                // Don't fail — ring server can still operate without archive
+                Logging.lprintf(0, "Storage mode is Sql but no PostgresConnStr configured — exiting");
+                return 1;
             }
         }
 
@@ -725,9 +749,12 @@ public static class Program
         Logging.lprintf(2, "   time window limit: {0}%", config.TimeWinLimit * 100);
         Logging.lprintf(2, "   resolve hostnames: {0}", config.ResolveHosts ? "yes" : "no");
         Logging.lprintf(2, "   auto recovery: {0}", config.AutoRecovery);
+        Logging.lprintf(2, "   storage mode: {0}", config.StorageMode);
         Logging.lprintf(2, "   TLS certificate file: {0}", config.TlsCertFile ?? "NONE");
         Logging.lprintf(2, "   TLS key file: {0}", config.TlsKeyFile ?? "NONE");
         Logging.lprintf(2, "   TLS verify client certificate: {0}", config.TlsVerifyClientCert ? "yes" : "no");
+        Logging.lprintf(2, "   PostgreSQL archive: {0}", string.IsNullOrEmpty(config.PostgresConnStr) ? "NONE" : "configured");
+        Logging.lprintf(2, "   PostgreSQL retention: {0} days", config.PostgresRetentionDays);
 
         Logging.lprintf(3, "   web root: {0}", config.WebRoot ?? "NONE");
         Logging.lprintf(3, "   HTTP headers: {0}", config.HttpHeaders ?? "NONE");
@@ -784,6 +811,23 @@ public static class Program
     {
         if (ringparams != null)
             RingBuffer.LogParameters(ringparams);
+    }
+
+    /// <summary>
+    /// Resolve the effective storage mode based on configuration.
+    /// Auto mode resolves to Sql if PostgresConnStr is configured, otherwise File.
+    /// </summary>
+    private static StorageMode ResolveStorageMode(ServerConfig config)
+    {
+        return config.StorageMode switch
+        {
+            StorageMode.File => StorageMode.File,
+            StorageMode.Sql => StorageMode.Sql,
+            StorageMode.Auto => !string.IsNullOrEmpty(config.PostgresConnStr)
+                ? StorageMode.Sql
+                : StorageMode.File,
+            _ => StorageMode.File
+        };
     }
 }
 

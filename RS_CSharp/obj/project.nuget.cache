@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "Iv2rjH3ogBs=",
+  "dgSpecHash": "F5DqjqX5Bcw=",
   "success": true,
-  "projectFilePath": "D:\\National Seismic Instrument\\Release\\Software\\RingServer_C#\\RingServer\\RingServer\\RingServer.csproj",
+  "projectFilePath": "D:\\National Seismic Instrument\\Release\\Software\\RingServer_Sharp\\RS_CSharp\\RingServer.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\prisw\\.nuget\\packages\\microsoft.extensions.dependencyinjection.abstractions\\8.0.2\\microsoft.extensions.dependencyinjection.abstractions.8.0.2.nupkg.sha512",
     "C:\\Users\\prisw\\.nuget\\packages\\microsoft.extensions.logging.abstractions\\8.0.2\\microsoft.extensions.logging.abstractions.8.0.2.nupkg.sha512",

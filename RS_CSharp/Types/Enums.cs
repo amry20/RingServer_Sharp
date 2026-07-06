@@ -131,3 +131,16 @@ public enum InfoElements : uint
     Connections    = 1u << 8,
     Status         = 1u << 9
 }
+
+/// <summary>
+/// Storage mode for ring buffer persistence.
+/// </summary>
+public enum StorageMode
+{
+    /// <summary>File-based ring buffer (default legacy mode)</summary>
+    File,
+    /// <summary>SQL database (PostgreSQL) as primary storage</summary>
+    Sql,
+    /// <summary>Auto-detect: use SQL if PostgresConnStr is configured, otherwise File</summary>
+    Auto
+}

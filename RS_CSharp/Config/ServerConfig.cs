@@ -120,6 +120,7 @@ public class ServerConfig
     public int MSeedIdleTo = Constants.DefaultMseedIdleTo;
     public string? PostgresConnStr;              // PostgreSQL connection string for archive
     public int PostgresRetentionDays;            // Auto-delete partitions older than N days (0 = keep forever)
+    public StorageMode StorageMode = StorageMode.Auto;  // Storage mode: File, Sql, or Auto
     public IPNet? LimitIps;
     public IPNet? MatchIps;
     public IPNet? RejectIps;
@@ -266,6 +267,20 @@ public static class ConfigProcessor
 
                 case "-NOAUTOREC":
                     config.AutoRecovery = 0;
+                    break;
+
+                case "-StorageMode":
+                    {
+                        string mode = GetOptVal(args, ref i).ToLowerInvariant();
+                        config.StorageMode = mode switch
+                        {
+                            "file" => StorageMode.File,
+                            "sql" => StorageMode.Sql,
+                            "auto" => StorageMode.Auto,
+                            _ => StorageMode.Auto
+                        };
+                        Logging.lprintf(1, "Storage mode set to: {0}", config.StorageMode);
+                    }
                     break;
 
                 case var _ when arg.StartsWith('-'):
@@ -492,6 +507,20 @@ public static class ConfigProcessor
             case "PostgresRetentionDays":
                 if (value != null && int.TryParse(value, out int prd))
                     config.PostgresRetentionDays = prd;
+                return 1;
+
+            case "StorageMode":
+                if (value != null)
+                {
+                    config.StorageMode = value.ToLowerInvariant() switch
+                    {
+                        "file" => StorageMode.File,
+                        "sql" => StorageMode.Sql,
+                        "auto" => StorageMode.Auto,
+                        _ => StorageMode.Auto
+                    };
+                    Logging.lprintf(1, "Storage mode set to: {0}", config.StorageMode);
+                }
                 return 1;
 
             case "MSeedScan":

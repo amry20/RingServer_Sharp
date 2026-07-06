@@ -191,11 +191,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "d:\\National Seismic Instrument\\Release\\Software\\RingServer_C#\\RingServer\\RingServer\\RingServer.csproj",
+      "projectUniqueName": "D:\\National Seismic Instrument\\Release\\Software\\RingServer_Sharp\\RS_CSharp\\RingServer.csproj",
       "projectName": "RingServer",
-      "projectPath": "d:\\National Seismic Instrument\\Release\\Software\\RingServer_C#\\RingServer\\RingServer\\RingServer.csproj",
+      "projectPath": "D:\\National Seismic Instrument\\Release\\Software\\RingServer_Sharp\\RS_CSharp\\RingServer.csproj",
       "packagesPath": "C:\\Users\\prisw\\.nuget\\packages\\",
-      "outputPath": "d:\\National Seismic Instrument\\Release\\Software\\RingServer_C#\\RingServer\\RingServer\\obj\\",
+      "outputPath": "D:\\National Seismic Instrument\\Release\\Software\\RingServer_Sharp\\RS_CSharp\\obj\\",
       "projectStyle": "PackageReference",
       "fallbackFolders": [
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
