@@ -24,6 +24,7 @@ using RingServer.Net;
 using RingServer.Ring;
 using RingServer.Types;
 using RingServer.Config;
+using RingServer.Mseed;
 using System.Collections.Generic;
 
 namespace RingServer.Protocols;
@@ -532,6 +533,25 @@ public static class DataLinkProtocol
         {
             SendPacket(cinfo, "ERROR", "Error adding packet to ring", 0, true, true);
             return -1;
+        }
+
+        // Archive to PostgreSQL if configured
+        var archive = ServerConfig.Archive;
+        if (archive != null)
+        {
+            var mseedRecord = new MseedRecord
+            {
+                StreamId = streamid,
+                StartTime = new NsTime(dsHt * 1000),
+                EndTime = new NsTime(deHt * 1000),
+                SampleRate = 0f, // Extract from miniSEED header later if needed
+                DataSize = dSize,
+                RawData = db,
+                PktId = p.PktId
+            };
+
+            // Non-blocking enqueue for batch write
+            archive.Enqueue(mseedRecord);
         }
 
         if (cinfo.Streams != null)

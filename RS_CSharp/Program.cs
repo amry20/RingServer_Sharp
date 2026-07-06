@@ -18,6 +18,7 @@
 
 using System.Runtime.InteropServices;
 using RingServer.Config;
+using RingServer.Mseed;
 using RingServer.Net;
 using RingServer.Ring;
 using RingServer.Types;
@@ -247,6 +248,23 @@ public static class Program
 
         // Store global ring parameters
         ServerConfig.RingParams = ringparams;
+
+        // Initialize PostgreSQL archive if configured
+        if (!string.IsNullOrEmpty(config.PostgresConnStr))
+        {
+            try
+            {
+                ServerConfig.Archive = new MseedArchive(config.PostgresConnStr,
+                    retentionDays: config.PostgresRetentionDays);
+                Logging.lprintf(1, "PostgreSQL archive initialized");
+            }
+            catch (Exception ex)
+            {
+                Logging.lprintf(0, "Failed to initialize PostgreSQL archive: {0}", ex.Message);
+                Logging.lprintf(0, "Continuing without archive — miniSEED will NOT be persisted");
+                // Don't fail — ring server can still operate without archive
+            }
+        }
 
         // Set server start time
         @params.ServerStartTime = Generic.NSnow();
@@ -609,6 +627,20 @@ public static class Program
 
             curtime = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             chktime = curtime;
+        }
+
+        // Dispose PostgreSQL archive
+        if (ServerConfig.Archive != null)
+        {
+            try
+            {
+                ServerConfig.Archive.Dispose();
+                Logging.lprintf(1, "PostgreSQL archive disposed");
+            }
+            catch (Exception ex)
+            {
+                Logging.lprintf(0, "Error disposing PostgreSQL archive: {0}", ex.Message);
+            }
         }
 
         // Shutdown ring buffer

@@ -99,6 +99,7 @@ public class ServerConfig
     public static ServerConfig Instance { get; } = new();
     public static ServerParams Params { get; } = new();
     public static RingParams? RingParams;            // Global ring parameters
+    public static Mseed.MseedArchive? Archive;       // Global PostgreSQL archive instance
 
     public string? ConfigFile;
     public string? ServerId;
@@ -117,6 +118,8 @@ public class ServerConfig
     public string? HttpHeaders;
     public string? MSeedArchive;
     public int MSeedIdleTo = Constants.DefaultMseedIdleTo;
+    public string? PostgresConnStr;              // PostgreSQL connection string for archive
+    public int PostgresRetentionDays;            // Auto-delete partitions older than N days (0 = keep forever)
     public IPNet? LimitIps;
     public IPNet? MatchIps;
     public IPNet? RejectIps;
@@ -480,6 +483,15 @@ public static class ConfigProcessor
 
             case "MSeedWrite":
                 config.MSeedArchive = value;
+                return 1;
+
+            case "PostgresConnStr":
+                config.PostgresConnStr = value;
+                return 1;
+
+            case "PostgresRetentionDays":
+                if (value != null && int.TryParse(value, out int prd))
+                    config.PostgresRetentionDays = prd;
                 return 1;
 
             case "MSeedScan":

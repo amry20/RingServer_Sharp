@@ -17,9 +17,12 @@
  **************************************************************************/
 
 using System.Text;
+using System.Collections.Generic;
 using RingServer.Net;
 using RingServer.Ring;
 using RingServer.Types;
+using RingServer.Config;
+using RingServer.Mseed;
 
 namespace RingServer.Protocols;
 
@@ -42,6 +45,12 @@ public class SLExtInfo
     public NsTime EndTime = NsTime.Unset;
     /// <summary>True if DATA command was received in station mode (waiting for END).</summary>
     public bool InStationMode = false;
+    /// <summary>Accumulated station IDs for this client (NET_STA format).</summary>
+    public List<string> SelectedStations = new();
+    /// <summary>Pending DB records for historical streaming (DB → ring fallback).</summary>
+    public Queue<MseedQueryResult>? DbRecords;
+    /// <summary>True if DB pre-fetch has been performed for this session.</summary>
+    public bool DbPreFetchDone;
 }
 
 /// <summary>
@@ -201,6 +210,13 @@ public static class SeedLinkProtocol
         if (cinfo.State != ClientState.Stream)
             return 0;
 
+        // DB fallback: send pre-fetched historical records before ring streaming
+        if (cinfo.ExtInfo is SLExtInfo slExt && slExt.DbRecords != null && slExt.DbRecords.Count > 0)
+        {
+            var dbRecord = slExt.DbRecords.Dequeue();
+            return SendDbRecord(cinfo, dbRecord, slExt.ProtoMajor);
+        }
+
         // Pre-allocate packet buffers (reused across calls)
         int packetDataSize = (int)(cinfo.RingParams.PktSize - RingPacket.SerializedSize);
         var packet = new RingPacket();
@@ -328,6 +344,79 @@ public static class SeedLinkProtocol
     }
 
     /// <summary>
+    /// Send a single pre-fetched DB record as a SeedLink packet.
+    /// Constructs the SeedLink header (v3 or v4) around the raw miniSEED data.
+    /// </summary>
+    private static int SendDbRecord(ClientInfo cinfo, MseedQueryResult record, int protoMajor)
+    {
+        byte[] rawData = record.RawData!;
+        int dataLen = rawData.Length;
+
+        if (dataLen == 0)
+            return 0;
+
+        byte[] header;
+        if (protoMajor == 4)
+        {
+            // v4 header
+            string streamId = record.StreamId;
+            string staid = "";
+            if (streamId.StartsWith("FDSN:"))
+            {
+                var parts = streamId.Split(':');
+                if (parts.Length > 1)
+                {
+                    var subParts = parts[^1].Split('_');
+                    if (subParts.Length >= 2)
+                        staid = $"{subParts[0]}_{subParts[1]}";
+                }
+            }
+            else
+            {
+                staid = streamId;
+            }
+
+            byte[] staidBytes = Encoding.ASCII.GetBytes(staid);
+            byte staidLen = (byte)staidBytes.Length;
+
+            // Determine format from miniSEED header
+            char format = ' ';
+            if (dataLen >= 3 && rawData[0] == 'M' && rawData[1] == 'S' && rawData[2] == 3)
+                format = '3';
+            else if (dataLen >= 8 && (rawData[6] == 'D' || rawData[6] == 'R' || rawData[6] == 'Q' || rawData[6] == 'M'))
+                format = '2';
+
+            header = new byte[17 + staidLen];
+            header[0] = (byte)'S';
+            header[1] = (byte)'E';
+            header[2] = (byte)format;
+            header[3] = (byte)'D';
+            BitConverter.TryWriteBytes(header.AsSpan(4, 4), (uint)dataLen);
+            BitConverter.TryWriteBytes(header.AsSpan(8, 8), record.PktId);
+            header[16] = staidLen;
+            if (staidLen > 0)
+                Buffer.BlockCopy(staidBytes, 0, header, 17, staidLen);
+        }
+        else
+        {
+            // v3 header: "SL" + 6-hex-digit sequence
+            string headerStr = $"SL{(record.PktId & 0xFFFFFF):X6}";
+            header = Encoding.ASCII.GetBytes(headerStr);
+        }
+
+        int result = SendData.SendBuffersToClient(
+            cinfo,
+            [header, rawData],
+            [header.Length, dataLen],
+            2,
+            false);
+        if (result < 0)
+            return result;
+
+        return header.Length + dataLen;
+    }
+
+    /// <summary>
     /// Send HELLO response with server capabilities.
     /// C original: SLSERVER_ID "\r\n" + config.serverid + "\r\n"
     /// Two lines: capabilities line, then server description.
@@ -396,6 +485,8 @@ public static class SeedLinkProtocol
         {
             slext.CurrentStation = staid;
             slext.InStationMode = true;  // Entered per-station mode
+            if (!slext.SelectedStations.Contains(staid))
+                slext.SelectedStations.Add(staid);
         }
 
         // Build regex matching all channels for this station (no selector yet)
@@ -666,6 +757,77 @@ public static class SeedLinkProtocol
             positioned = true;
             Logging.lprintf(2, "[{0}] END: positioned ring by start time {1}",
                 cinfo.Hostname, slext.StartTime);
+        }
+
+        // Step 2b: If PostgreSQL archive is available and the requested start time
+        // is earlier than what the ring buffer holds, pre-fetch historical data from DB.
+        if (slext != null && slext.StartTime != NsTime.Unset &&
+            slext.StartTime != NsTime.Error && !slext.DbPreFetchDone)
+        {
+            var archive = ServerConfig.Archive;
+            if (archive != null)
+            {
+                // Check if ring has data covering the requested time
+                // After positioning, if reader has RingIdNext and the ring's
+                // earliest data is newer than the requested start, we need DB fallback
+                bool needDbFallback = false;
+                if (cinfo.Reader!.PktId == Constants.RingIdNext)
+                {
+                    // Reader positioned to next — ring doesn't have this time range
+                    needDbFallback = true;
+                }
+                else if (cinfo.Reader!.PktId > Constants.RingIdEarliest)
+                {
+                    // Check if the positioned packet's data start is after requested start
+                    // We'll do a best-effort DB pre-fetch and let the client merge timestamps
+                    needDbFallback = true;
+                }
+
+                if (needDbFallback)
+                {
+                    try
+                    {
+                        // Build list of stream IDs to query
+                        var streamIds = new List<string>();
+                        if (slext.SelectedStations.Count > 0)
+                        {
+                            // Convert NET_STA to FDSN wildcard: "VG_STNM0" → "FDSN:VG_STNM0_%"
+                            foreach (var staid in slext.SelectedStations)
+                            {
+                                streamIds.Add($"FDSN:{staid}_%");
+                            }
+                        }
+                        else
+                        {
+                            // All stations
+                            streamIds.Add("%");
+                        }
+
+                        NsTime dbEnd = slext.EndTime.IsUnset ? NsTime.Unset : slext.EndTime;
+
+                        var dbResults = archive.QueryByTime(
+                            streamIds, slext.StartTime, dbEnd, 5000);
+
+                        if (dbResults.Count > 0)
+                        {
+                            slext.DbRecords = new Queue<MseedQueryResult>(dbResults);
+                            Logging.lprintf(1, "[{0}] END: pre-fetched {1} historical records from DB",
+                                cinfo.Hostname, dbResults.Count);
+                        }
+                        else
+                        {
+                            Logging.lprintf(2, "[{0}] END: no historical records in DB for time range",
+                                cinfo.Hostname);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logging.lprintf(0, "[{0}] END: DB pre-fetch failed: {1}",
+                            cinfo.Hostname, ex.Message);
+                    }
+                }
+            }
+            slext.DbPreFetchDone = true;
         }
 
         // Step 3: Fallback — if reader still has RINGID_NONE, set to RINGID_NEXT
