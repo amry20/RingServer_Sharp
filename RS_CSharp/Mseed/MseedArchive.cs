@@ -568,14 +568,16 @@ public class MseedArchive : IDisposable
         }
         else if (streamIds.Count > 0)
         {
-            var streamParams = new List<string>();
+            var likeClauses = new List<string>();
             for (int i = 0; i < streamIds.Count; i++)
             {
                 string param = $"@stream_{i}";
-                streamParams.Add(param);
-                cmd.Parameters.AddWithValue($"stream_{i}", streamIds[i]);
+                // Escape literal underscores in LIKE pattern (underscore is FDSN separator)
+                string escaped = streamIds[i].Replace("_", "\\_");
+                likeClauses.Add($"s.stream_id LIKE {param} ESCAPE '\\'");
+                cmd.Parameters.AddWithValue($"stream_{i}", escaped);
             }
-            sql.AppendLine($"  AND s.stream_id IN ({string.Join(", ", streamParams)})");
+            sql.AppendLine($"  AND ({string.Join(" OR ", likeClauses)})");
         }
 
         sql.AppendLine("ORDER BY mr.start_time ASC");

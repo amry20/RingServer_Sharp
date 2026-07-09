@@ -51,6 +51,18 @@ public class SLExtInfo
     public Queue<MseedQueryResult>? DbRecords;
     /// <summary>True if DB pre-fetch has been performed for this session.</summary>
     public bool DbPreFetchDone;
+    /// <summary>End time of the last DB record sent. Used to reposition ring reader after DB exhaustion.</summary>
+    public NsTime LastDbEndTime = NsTime.Unset;
+    /// <summary>The requested end time from TIME command. When DB pagination reaches this time, stop refetching.</summary>
+    public NsTime DbQueryEndTime = NsTime.Unset;
+    /// <summary>The stream ID LIKE patterns used for DB queries (stored for pagination refetch).</summary>
+    public List<string>? DbQueryStreamIds;
+    /// <summary>Cached RingPacket for StreamPackets (avoid per-call GC allocations).</summary>
+    internal RingPacket? CachedPacket;
+    /// <summary>Cached packet data buffer for StreamPackets.</summary>
+    internal byte[]? CachedPacketData;
+    /// <summary>Cached size of the packet data buffer.</summary>
+    internal int CachedPacketDataSize;
 }
 
 /// <summary>
@@ -214,13 +226,46 @@ public static class SeedLinkProtocol
         if (cinfo.ExtInfo is SLExtInfo slExt && slExt.DbRecords != null && slExt.DbRecords.Count > 0)
         {
             var dbRecord = slExt.DbRecords.Dequeue();
+
+            // Track end time of last DB record for ring repositioning
+            slExt.LastDbEndTime = dbRecord.EndTime;
+
+            // If this was the last DB record, try to fetch more from DB or reposition ring.
+            if (slExt.DbRecords.Count == 0)
+            {
+                HandleDbQueueExhausted(cinfo, slExt);
+            }
+
             return SendDbRecord(cinfo, dbRecord, slExt.ProtoMajor);
         }
 
-        // Pre-allocate packet buffers (reused across calls)
+        // Use cached buffers to avoid per-call GC pressure.
+        // Allocating new byte[~4096] + new RingPacket() every iteration causes
+        // ~42MB/sec garbage for high-throughput streaming, leading to GC pauses
+        // that cause the reader to fall behind and miss packets (gaps).
+        var slextInfo = cinfo.ExtInfo as SLExtInfo;
         int packetDataSize = (int)(cinfo.RingParams.PktSize - RingPacket.SerializedSize);
-        var packet = new RingPacket();
-        var packetData = new byte[packetDataSize];
+
+        RingPacket packet;
+        byte[] packetData;
+
+        if (slextInfo?.CachedPacket != null && slextInfo.CachedPacketData != null &&
+            slextInfo.CachedPacketDataSize == packetDataSize)
+        {
+            packet = slextInfo.CachedPacket;
+            packetData = slextInfo.CachedPacketData;
+        }
+        else
+        {
+            packet = new RingPacket();
+            packetData = new byte[packetDataSize];
+            if (slextInfo != null)
+            {
+                slextInfo.CachedPacket = packet;
+                slextInfo.CachedPacketData = packetData;
+                slextInfo.CachedPacketDataSize = packetDataSize;
+            }
+        }
 
         Array.Clear(packetData, 0, packetData.Length);
 
@@ -341,6 +386,69 @@ public static class SeedLinkProtocol
 
         int sentBytes = header.Length + dataLen;
         return sentBytes;
+    }
+
+    /// <summary>
+    /// Called when the DB pre-fetch queue is empty.
+    /// Tries to fetch more data from DB (pagination) before falling back to ring.
+    /// This is critical for queries spanning large time ranges where the DB
+    /// has more data than the initial LIMIT allows.
+    /// </summary>
+    private static void HandleDbQueueExhausted(ClientInfo cinfo, SLExtInfo slExt)
+    {
+        Logging.lprintf(1, "[{0}] DB queue exhausted (last end_time={1}, query_end_time={2})",
+            cinfo.Hostname,
+            slExt.LastDbEndTime.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss"),
+            slExt.DbQueryEndTime.IsUnset ? "unset" : slExt.DbQueryEndTime.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss"));
+
+        // Check if there is more data in DB between last record end and the requested end time
+        if (!slExt.DbQueryEndTime.IsUnset && slExt.LastDbEndTime < slExt.DbQueryEndTime)
+        {
+            var archive = ServerConfig.Archive;
+            if (archive != null && slExt.DbQueryStreamIds != null && slExt.DbQueryStreamIds.Count > 0)
+            {
+                try
+                {
+                    // Fetch next batch starting just after the last record we sent.
+                    // Add 1 millisecond to avoid re-fetching the exact same record.
+                    NsTime nextStart = new NsTime(slExt.LastDbEndTime.Value + 1_000_000L);
+
+                    var nextBatch = archive.QueryByTime(
+                        slExt.DbQueryStreamIds, nextStart, slExt.DbQueryEndTime, 10000);
+
+                    if (nextBatch.Count > 0)
+                    {
+                        slExt.DbRecords = new Queue<MseedQueryResult>(nextBatch);
+                        Logging.lprintf(1, "[{0}] DB pagination: refetched {1} more records from {2}",
+                            cinfo.Hostname, nextBatch.Count,
+                            nextBatch[0].StartTime.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss"));
+                        return; // Queue is now filled — StreamPackets will pick up from here
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logging.lprintf(0, "[{0}] DB pagination refetch failed: {1}",
+                        cinfo.Hostname, ex.Message);
+                }
+            }
+        }
+
+        // No more DB data — try ring, otherwise fall back to live
+        var rb = new RingBuffer(cinfo.RingParams);
+        ulong repositioned = rb.After(cinfo.Reader!, slExt.LastDbEndTime, 0);
+
+        if (repositioned != Constants.RingIdNone && repositioned != Constants.RingIdError)
+        {
+            Logging.lprintf(2, "[{0}] Ring positioned to pktid={1} at offset={2} after DB",
+                cinfo.Hostname, repositioned, cinfo.Reader!.PktOffset);
+        }
+        else
+        {
+            Logging.lprintf(1, "[{0}] Ring has no packets after DB end_time, falling back to RINGID_NEXT",
+                cinfo.Hostname);
+            cinfo.Reader!.PktOffset = -1;
+            cinfo.Reader!.PktId = Constants.RingIdNext;
+        }
     }
 
     /// <summary>
@@ -679,10 +787,16 @@ public static class SeedLinkProtocol
             if (slext != null)
             {
                 slext.StartTime = startTime;
-                slext.EndTime = endTime;
+                // Only update EndTime if explicitly provided.
+                // SWARM sends two TIME commands: first with start+end, then start-only.
+                // Overwriting EndTime to Unset would break DB pagination upper bound.
+                if (!endTime.IsUnset)
+                    slext.EndTime = endTime;
             }
-            Logging.lprintf(2, "[{0}] TIME in station mode: start={1} end={2}",
-                cinfo.Hostname, parts[1], parts.Length >= 3 ? parts[2] : "none");
+            Logging.lprintf(2, "[{0}] TIME in station mode: start={1} end={2} (prev_end={3})",
+                cinfo.Hostname, parts[1],
+                parts.Length >= 3 ? parts[2] : "none",
+                slext?.EndTime.IsUnset == false ? slext.EndTime.ToIsoString() : "unset");
             SendResponse(cinfo, "OK");
         }
         else
@@ -694,7 +808,36 @@ public static class SeedLinkProtocol
             if (slext != null)
             {
                 slext.StartTime = startTime;
-                slext.EndTime = endTime;
+                // Only update EndTime if explicitly provided (same guard as station mode)
+                if (!endTime.IsUnset)
+                    slext.EndTime = endTime;
+            }
+
+            // Pre-fetch historical data from PostgreSQL if archive is available
+            var archive = ServerConfig.Archive;
+            if (archive != null && slext != null)
+            {
+                try
+                {
+                    var streamIds = new List<string> { "%" };
+                    slext.DbQueryStreamIds = streamIds;
+                    NsTime dbEnd = slext.EndTime.IsUnset ? NsTime.Unset : slext.EndTime;
+                    var dbResults = archive.QueryByTime(streamIds, slext.StartTime, dbEnd, 10000);
+                    if (dbResults.Count > 0)
+                    {
+                        slext.DbRecords = new Queue<MseedQueryResult>(dbResults);
+                        slext.DbQueryEndTime = dbEnd;
+                        Logging.lprintf(1, "[{0}] TIME: pre-fetched {1} historical records from DB (last_end={2}, queried_end={3})",
+                            cinfo.Hostname, dbResults.Count,
+                            dbResults[^1].EndTime.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss"),
+                            dbEnd.IsUnset ? "unset" : dbEnd.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss"));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logging.lprintf(0, "[{0}] TIME: DB pre-fetch failed: {1}",
+                        cinfo.Hostname, ex.Message);
+                }
             }
 
             var ringBuffer = new RingBuffer(cinfo.RingParams);
@@ -716,6 +859,16 @@ public static class SeedLinkProtocol
     /// </summary>
     private static void HandleEnd(ClientInfo cinfo)
     {
+        // Guard: if already streaming (e.g., SWARM sends duplicate END),
+        // don't re-process — it would reposition the ring reader and
+        // corrupt or re-send already-acknowledged data.
+        if (cinfo.State == ClientState.Stream)
+        {
+            Logging.lprintf(2, "[{0}] END: already streaming, ignoring duplicate END",
+                cinfo.Hostname);
+            return;
+        }
+
         var slext = cinfo.ExtInfo as SLExtInfo;
         var ringBuffer = new RingBuffer(cinfo.RingParams);
         bool positioned = false;
@@ -767,64 +920,51 @@ public static class SeedLinkProtocol
             var archive = ServerConfig.Archive;
             if (archive != null)
             {
-                // Check if ring has data covering the requested time
-                // After positioning, if reader has RingIdNext and the ring's
-                // earliest data is newer than the requested start, we need DB fallback
-                bool needDbFallback = false;
-                if (cinfo.Reader!.PktId == Constants.RingIdNext)
+                try
                 {
-                    // Reader positioned to next — ring doesn't have this time range
-                    needDbFallback = true;
-                }
-                else if (cinfo.Reader!.PktId > Constants.RingIdEarliest)
-                {
-                    // Check if the positioned packet's data start is after requested start
-                    // We'll do a best-effort DB pre-fetch and let the client merge timestamps
-                    needDbFallback = true;
-                }
-
-                if (needDbFallback)
-                {
-                    try
+                    // Build list of stream IDs to query
+                    var streamIds = new List<string>();
+                    if (slext.SelectedStations.Count > 0)
                     {
-                        // Build list of stream IDs to query
-                        var streamIds = new List<string>();
-                        if (slext.SelectedStations.Count > 0)
+                        // Convert NET_STA to FDSN wildcard: "VG_STNM0" → "FDSN:VG_STNM0_%"
+                        foreach (var staid in slext.SelectedStations)
                         {
-                            // Convert NET_STA to FDSN wildcard: "VG_STNM0" → "FDSN:VG_STNM0_%"
-                            foreach (var staid in slext.SelectedStations)
-                            {
-                                streamIds.Add($"FDSN:{staid}_%");
-                            }
-                        }
-                        else
-                        {
-                            // All stations
-                            streamIds.Add("%");
-                        }
-
-                        NsTime dbEnd = slext.EndTime.IsUnset ? NsTime.Unset : slext.EndTime;
-
-                        var dbResults = archive.QueryByTime(
-                            streamIds, slext.StartTime, dbEnd, 5000);
-
-                        if (dbResults.Count > 0)
-                        {
-                            slext.DbRecords = new Queue<MseedQueryResult>(dbResults);
-                            Logging.lprintf(1, "[{0}] END: pre-fetched {1} historical records from DB",
-                                cinfo.Hostname, dbResults.Count);
-                        }
-                        else
-                        {
-                            Logging.lprintf(2, "[{0}] END: no historical records in DB for time range",
-                                cinfo.Hostname);
+                            streamIds.Add($"FDSN:{staid}_%");
                         }
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        Logging.lprintf(0, "[{0}] END: DB pre-fetch failed: {1}",
-                            cinfo.Hostname, ex.Message);
+                        // All stations
+                        streamIds.Add("%");
                     }
+
+                    // Save stream patterns for DB pagination refetch
+                    slext.DbQueryStreamIds = streamIds;
+
+                    NsTime dbEnd = slext.EndTime.IsUnset ? NsTime.Unset : slext.EndTime;
+
+                    var dbResults = archive.QueryByTime(
+                        streamIds, slext.StartTime, dbEnd, 10000);
+
+                    if (dbResults.Count > 0)
+                    {
+                        slext.DbRecords = new Queue<MseedQueryResult>(dbResults);
+                        slext.DbQueryEndTime = dbEnd;
+                        Logging.lprintf(1, "[{0}] END: pre-fetched {1} historical records from DB (end_time={2}, queried_end={3})",
+                            cinfo.Hostname, dbResults.Count,
+                            dbResults[^1].EndTime.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss"),
+                            dbEnd.IsUnset ? "unset" : dbEnd.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss"));
+                    }
+                    else
+                    {
+                        Logging.lprintf(2, "[{0}] END: no historical records in DB for time range",
+                            cinfo.Hostname);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logging.lprintf(0, "[{0}] END: DB pre-fetch failed: {1}",
+                        cinfo.Hostname, ex.Message);
                 }
             }
             slext.DbPreFetchDone = true;
@@ -1072,6 +1212,20 @@ public static class SeedLinkProtocol
             string xml = BuildInfoCapabilitiesXml();
             SendInfoMseed(cinfo, xml, false);
         }
+        else if (level == "CONNECTIONS")
+        {
+            if (!cinfo.Trusted)
+            {
+                Logging.lprintf(1, "[{0}] Refusing INFO CONNECTIONS request from un-trusted client", cinfo.Hostname);
+                string xml = BuildInfoIdXml();
+                SendInfoMseed(cinfo, xml, true); // errflag=true
+            }
+            else
+            {
+                string xml = BuildInfoConnectionsXml(cinfo);
+                SendInfoMseed(cinfo, xml, false);
+            }
+        }
         else
         {
             // Unknown level — send ID as fallback
@@ -1178,7 +1332,7 @@ public static class SeedLinkProtocol
             }
             if (beginSeq == ulong.MaxValue) beginSeq = 0;
 
-            sb.Append($"  <station name=\"{EscapeXml(sta)}\" network=\"{EscapeXml(net)}\" description=\"\" begin_seq=\"{beginSeq}\" end_seq=\"{endSeq}\" stream_check=\"enabled\">\r\n");
+            sb.Append($"  <station name=\"{EscapeXml(sta)}\" network=\"{EscapeXml(net)}\" description=\"Station ID {EscapeXml(stationKey)}\" begin_seq=\"{beginSeq}\" end_seq=\"{endSeq}\" stream_check=\"enabled\">\r\n");
 
             if (includeStreams)
             {
@@ -1186,11 +1340,79 @@ public static class SeedLinkProtocol
                 {
                     // Parse location + seedname from stream ID
                     ParseStreamComponents(s.StreamId.Trim('\0', ' '), out string loc, out string seedname);
-                    sb.Append($"    <stream location=\"{EscapeXml(loc)}\" seedname=\"{EscapeXml(seedname)}\" type=\"D\"/>\r\n");
+
+                    // Format begin/end times as ISO8601 with microseconds (matching C original)
+                    string beginTime = (s.EarliestDsTime.IsUnset || s.EarliestDsTime.Value == 0) ? "" : s.EarliestDsTime.ToIsoString();
+                    string endTime = (s.LatestDeTime.IsUnset || s.LatestDeTime.Value == 0) ? "" : s.LatestDeTime.ToIsoString();
+
+                    sb.Append($"    <stream location=\"{EscapeXml(loc)}\" seedname=\"{EscapeXml(seedname)}\" type=\"D\" begin_time=\"{EscapeXml(beginTime)}\" end_time=\"{EscapeXml(endTime)}\"/>\r\n");
                 }
             }
 
             sb.Append("  </station>\r\n");
+        }
+
+        sb.Append("</seedlink>\r\n");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Build INFO CONNECTIONS XML response.
+    /// Equivalent to info_xml_slv3_connections() in infoxml.c.
+    /// Each connected client is wrapped in a &lt;station&gt; element with a &lt;connection&gt; child,
+    /// matching SeedLink v3 XML schema for compatibility with slinktool.
+    /// </summary>
+    private static string BuildInfoConnectionsXml(ClientInfo cinfo)
+    {
+        var config = RingServer.Config.ServerConfig.Instance;
+        string software = Constants.SlServerId;
+        string org = config.ServerId ?? "RingServer";
+        string started = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+        var sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\"?>\r\n");
+        sb.Append($"<seedlink software=\"{EscapeXml(software)}\" organization=\"{EscapeXml(org)}\" started=\"{started}\">\r\n");
+
+        lock (ServerConfig.Params.CthreadsLock)
+        {
+            var curr = ServerConfig.Params.Cthreads;
+            while (curr != null)
+            {
+                if (curr.Td?.PrivatePtr is ClientInfo tc && curr.Td.State == RingServer.Types.ThreadState.Active)
+                {
+                    // Determine network code from connection type (matching C original)
+                    string network = tc.Type switch
+                    {
+                        ClientType.DataLink => "DL",
+                        ClientType.SeedLink => "SL",
+                        ClientType.Http => "HP",
+                        _ => "??"
+                    };
+
+                    sb.Append($"  <station name=\"CLIENT\" network=\"{network}\" description=\"Ringserver Client\" begin_seq=\"0\" end_seq=\"0\" stream_check=\"enabled\">\r\n");
+
+                    // Build connection element
+                    string ctime = tc.ConnTime.IsUnset ? "" : tc.ConnTime.ToIsoString();
+                    string pktid = (tc.Reader?.PktId > 0 && tc.Reader.PktId <= Constants.RingIdMaximum) ? tc.Reader.PktId.ToString() : "0";
+                    string txcount = tc.TxPackets[0].ToString();
+                    string txbytes = tc.TxBytes[0].ToString();
+
+                    sb.Append($"    <connection host=\"{EscapeXml(tc.Hostname)}\"");
+                    sb.Append($" port=\"{EscapeXml(tc.PortStr)}\"");
+                    sb.Append($" ctime=\"{EscapeXml(ctime)}\"");
+                    sb.Append($" begin_seq=\"0\"");
+                    sb.Append($" current_seq=\"{pktid}\"");
+                    sb.Append($" sequence_gaps=\"0\"");
+                    sb.Append($" txcount=\"{txcount}\"");
+                    sb.Append($" totBytes=\"{txbytes}\"");
+                    sb.Append($" begin_seq_valid=\"yes\"");
+                    sb.Append($" realtime=\"yes\"");
+                    sb.Append($" end_of_data=\"no\"/>");
+
+                    sb.Append("\r\n  </station>\r\n");
+                }
+                curr = curr.Next;
+            }
         }
 
         sb.Append("</seedlink>\r\n");

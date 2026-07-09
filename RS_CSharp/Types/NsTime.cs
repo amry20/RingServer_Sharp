@@ -110,12 +110,12 @@ public readonly struct NsTime : IEquatable<NsTime>, IComparable<NsTime>
     }
 
     /// <summary>
-    /// Format as ISO time string (equivalent to ms_nstime2timestr)
+    /// Format as ISO time string with microsecond precision (equivalent to ms_nstime2timestr with ISOMONTHDAY_Z | MICRO)
     /// </summary>
     public string ToIsoString()
     {
         if (IsUnset) return "UNSET";
         if (IsError) return "ERROR";
-        return ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss.ffffff");
+        return ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss.ffffff") + "Z";
     }
 }

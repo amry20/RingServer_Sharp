@@ -677,15 +677,17 @@ public class RingBuffer
             return Constants.RingIdNone;
         }
 
-        // Get latest packet details
-        var latestPkt = ReadPacketAtOffset(latestOffset);
-        if (latestPkt == null)
+        // Read latest packet fields directly from buffer (avoid RingPacket allocation).
+        // Serialized layout: offset(8) + pktid(8) + pkttime(8) + nextinstream(8) +
+        //   streamid(60) + datastart(8) + dataend(8) + datasize(4) = 112 bytes
+        int latestBufOff = _ringParams.DataOffset + (int)latestOffset;
+        if (latestBufOff + RingPacket.SerializedSize > _ringParams.DataBuffer.Length)
             return Constants.RingIdNone;
 
-        ulong latestId = latestPkt.PktId;
-        NsTime latestPTime = latestPkt.PktTime;
-        NsTime latestDsTime = latestPkt.DataStart;
-        NsTime latestDeTime = latestPkt.DataEnd;
+        ulong latestId = BitConverter.ToUInt64(_ringParams.DataBuffer.AsSpan(latestBufOff + 8));
+        NsTime latestPTime = new NsTime(BitConverter.ToInt64(_ringParams.DataBuffer.AsSpan(latestBufOff + 16)));
+        NsTime latestDsTime = new NsTime(BitConverter.ToInt64(_ringParams.DataBuffer.AsSpan(latestBufOff + 92)));
+        NsTime latestDeTime = new NsTime(BitConverter.ToInt64(_ringParams.DataBuffer.AsSpan(latestBufOff + 100)));
 
         long offset;
 
@@ -807,9 +809,21 @@ public class RingBuffer
                     }
                 }
 
-                // Sanity check
-                if (pktTime != pkt.PktTime)
-                    return Constants.RingIdNone;
+                // Sanity check: re-read PktTime directly from the live ring buffer
+                // (not from the deserialized copy) to detect if the slot was
+                // overwritten during our processing (race condition / ring wrap).
+                // Equivalent to C original: if (pkttime != pkt->pkttime) return RINGID_NONE;
+                // where pkt is a LIVE pointer to shared memory.
+                int pktTimeBufOff = _ringParams.DataOffset + (int)offset + 16;
+                if (pktTimeBufOff + 8 <= _ringParams.DataBuffer.Length)
+                {
+                    long livePktTime = BitConverter.ToInt64(_ringParams.DataBuffer.AsSpan(pktTimeBufOff, 8));
+                    if (pktTime.Value != livePktTime)
+                    {
+                        Logging.lprintf(2, $"RingReadNext(): pkttime mismatch (copy={pktTime.Value}, live={livePktTime}) — slot overwritten, skipping");
+                        return Constants.RingIdNone;
+                    }
+                }
 
                 return packet.PktId;
             }
