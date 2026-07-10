@@ -209,7 +209,7 @@ public static class ListenServer
                     PrivatePtr = cinfo
                 };
 
-                var ctThread = new System.Threading.Thread(() => ClientHandler.Run(clientTdp))
+                var ctThread = new System.Threading.Thread(() => ClientHandler.Run(clientTdp), 131072)
                 {
                     IsBackground = true,
                     Name = $"Client-{ipStr}:{portStr}"

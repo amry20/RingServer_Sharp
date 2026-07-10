@@ -27,6 +27,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Data;
 using System.Text;
+using System.Threading.Tasks;
 using Npgsql;
 using NpgsqlTypes;
 using RingServer.Types;
@@ -81,6 +82,14 @@ public class MseedArchive : IDisposable
     private readonly int _retentionDays;
     private Timer? _retentionTimer;
 
+    // Track already-created partitions to avoid repeated DB checks
+    private readonly HashSet<string> _createdPartitions = new();
+    private readonly object _partitionLock = new();
+
+    // Inline circular-buffer eviction throttle
+    private DateTime _lastInlinePrune = DateTime.MinValue;
+    private const int InlinePruneIntervalMs = 30_000;  // prune from write path at most every 30s
+
     /// <summary>
     /// Creates a new MseedArchive connected to PostgreSQL.
     /// Creates tables and indexes if they don't exist.
@@ -96,17 +105,45 @@ public class MseedArchive : IDisposable
         _batchIntervalMs = batchIntervalMs;
         _retentionDays = retentionDays;
 
-        // Ensure the target database exists (auto-create if missing)
-        EnsureDatabaseExists(connectionString);
+        // Inject PostgreSQL performance tuning into connection string Options parameter.
+        // This ensures EVERY connection from the pool applies these settings on connect.
+        // - work_mem=32MB: avoids 12MB disk spill on TIME range sort queries
+        // - synchronous_commit=off: avoids fsync wait per INSERT transaction
+        var csb = new NpgsqlConnectionStringBuilder(connectionString);
+        var existingOptions = csb.Options ?? "";
+        if (!existingOptions.Contains("work_mem"))
+            existingOptions += " -c work_mem=32MB";
+        if (!existingOptions.Contains("synchronous_commit"))
+            existingOptions += " -c synchronous_commit=off";
+        csb.Options = existingOptions.Trim();
+        var tunedConnString = csb.ToString();
 
-        var builder = new NpgsqlDataSourceBuilder(connectionString);
+        var builder = new NpgsqlDataSourceBuilder(tunedConnString);
         builder.ConnectionStringBuilder.Pooling = true;
         builder.ConnectionStringBuilder.MaxPoolSize = 50;
-        builder.ConnectionStringBuilder.MinPoolSize = 2;
+        builder.ConnectionStringBuilder.MinPoolSize = 0;      // lazy-connect only when needed (no eager delay)
+        builder.ConnectionStringBuilder.ConnectionIdleLifetime = 30;  // recycle idle connections quickly
         _dataSource = builder.Build();
 
-        InitializeSchema();
-        StartFlushTimer();
+        // ── Non-blocking startup ──
+        // DB existence check + schema init + flush timer all run on background.
+        // This lets ringserver bind sockets and accept clients immediately,
+        // while PostgreSQL setup completes asynchronously.
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                EnsureDatabaseExists(connectionString);
+                InitializeSchema();
+                Logging.lprintf(1, "MseedArchive: DB ready, starting flush timer");
+                StartFlushTimer();
+            }
+            catch (Exception ex)
+            {
+                Logging.lprintf(0, "MseedArchive: FATAL — DB init failed: {0}", ex.Message);
+                throw;
+            }
+        });
 
         if (_retentionDays > 0)
         {
@@ -127,10 +164,13 @@ public class MseedArchive : IDisposable
         var csb = new NpgsqlConnectionStringBuilder(connectionString);
         string targetDb = csb.Database ?? "ringserver";
 
+        // Set a short timeout for the existence check — avoid 15s block on quick restart
+        csb.Timeout = 5;
+
         // Try connecting to the target database first
         try
         {
-            using var testConn = new NpgsqlConnection(connectionString);
+            using var testConn = new NpgsqlConnection(csb.ConnectionString);
             testConn.Open();
             testConn.Close();
             Logging.lprintf(1, "Database '{0}' already exists", targetDb);
@@ -150,7 +190,8 @@ public class MseedArchive : IDisposable
         // Connect to 'postgres' database to create the target database
         var postgresCsb = new NpgsqlConnectionStringBuilder(connectionString)
         {
-            Database = "postgres"
+            Database = "postgres",
+            Timeout = 5
         };
 
         try
@@ -253,13 +294,40 @@ public class MseedArchive : IDisposable
 
     /// <summary>
     /// Ensure a partition exists for the given date. Creates if missing.
+    /// Thread-safe; uses a HashSet to track already-created partitions so we
+    /// only hit the database the first time per day.
     /// </summary>
-    private void EnsurePartition(DateTime date)
+    private void EnsurePartition(NpgsqlConnection conn, DateTime date)
     {
-        // We batch partition creation to avoid per-record overhead.
-        // Partitions are created lazily on first write to a given day.
-        // For initial deployment, pg_partman or a cron job is recommended.
-        // This serves as fallback.
+        string partName = $"mseed_records_{date:yyyyMMdd}";
+
+        // Fast path: already created this partition in this session
+        lock (_partitionLock)
+        {
+            if (_createdPartitions.Contains(partName))
+                return;
+        }
+
+        string todayStart = date.ToString("yyyy-MM-dd");
+        string todayEnd = date.AddDays(1).ToString("yyyy-MM-dd");
+
+        using var checkCmd = conn.CreateCommand();
+        checkCmd.CommandText = "SELECT 1 FROM pg_class WHERE relname = @name AND relkind = 'r' AND relispartition = true";
+        checkCmd.Parameters.AddWithValue("name", partName);
+
+        var exists = checkCmd.ExecuteScalar() != null;
+        if (!exists)
+        {
+            using var createCmd = conn.CreateCommand();
+            createCmd.CommandText = $"CREATE TABLE IF NOT EXISTS {partName} PARTITION OF mseed_records FOR VALUES FROM ('{todayStart}') TO ('{todayEnd}')";
+            createCmd.ExecuteNonQuery();
+            Logging.lprintf(1, "MseedArchive: created partition {0}", partName);
+        }
+
+        lock (_partitionLock)
+        {
+            _createdPartitions.Add(partName);
+        }
     }
 
     /// <summary>
@@ -274,9 +342,99 @@ public class MseedArchive : IDisposable
     }
 
     /// <summary>
+    /// Lightweight inline eviction called from the write path.
+    /// Throttled to at most once per InlinePruneIntervalMs (30s).
+    /// This gives true circular-buffer behaviour: every incoming byte
+    /// eventually displaces an expired byte.
+    /// </summary>
+    private void InlineEvictExpired()
+    {
+        if (_retentionDays <= 0) return;
+
+        var now = DateTime.UtcNow;
+        if ((now - _lastInlinePrune).TotalMilliseconds < InlinePruneIntervalMs)
+            return;
+
+        _lastInlinePrune = now;
+
+        try
+        {
+            var cutoff = now.AddDays(-_retentionDays);
+            using var conn = _dataSource.OpenConnection();
+
+            // Only delete from the boundary partition (precision delete).
+            // Full-partition drops are left to the hourly timer since they
+            // are rare (1 partition per day) and DDL-free on the write path.
+            var boundaryPartition = $"mseed_records_{cutoff:yyyyMMdd}";
+
+            using var checkCmd = conn.CreateCommand();
+            checkCmd.CommandText = @"
+                SELECT 1 FROM pg_class
+                WHERE relname = @name AND relkind = 'r' AND relispartition = true";
+            checkCmd.Parameters.AddWithValue("name", boundaryPartition);
+
+            if (checkCmd.ExecuteScalar() != null)
+            {
+                using var delCmd = conn.CreateCommand();
+                delCmd.CommandText = "DELETE FROM mseed_records WHERE start_time < @cutoff";
+                delCmd.Parameters.AddWithValue("cutoff", cutoff);
+                int deleted = delCmd.ExecuteNonQuery();
+
+                if (deleted > 0)
+                {
+                    Logging.lprintf(2, "MseedArchive: inline evicted {0} rows (cutoff={1:yyyy-MM-dd HH:mm})",
+                        deleted, cutoff);
+                }
+            }
+
+            // Also drop partitions entirely before the boundary (quick DDL,
+            // runs at most once per day since they are pre-boundary).
+            // We guard it with a date check to avoid scanning pg_class on
+            // every inline call.
+            var preBoundary = cutoff.Date.AddDays(-1);
+            var prePartition = $"mseed_records_{preBoundary:yyyyMMdd}";
+
+            using var preCmd = conn.CreateCommand();
+            preCmd.CommandText = @"
+                SELECT relname FROM pg_class
+                WHERE relname < @boundary
+                  AND relname ~ '^mseed_records_[0-9]{8}$'
+                  AND relkind = 'r' AND relispartition = true
+                ORDER BY relname";
+            preCmd.Parameters.AddWithValue("boundary", boundaryPartition);
+
+            var toDrop = new List<string>();
+            using var reader = preCmd.ExecuteReader();
+            while (reader.Read()) toDrop.Add(reader.GetString(0));
+            reader.Close();
+
+            foreach (var part in toDrop)
+            {
+                using var dropCmd = conn.CreateCommand();
+                dropCmd.CommandText = $"DROP TABLE IF EXISTS {part}";
+                dropCmd.ExecuteNonQuery();
+                Logging.lprintf(1, "MseedArchive: inline dropped partition {0}", part);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Inline eviction must never crash the write path
+            Logging.lprintf(2, "MseedArchive: inline eviction skipped: {0}", ex.Message);
+        }
+    }
+
     /// Drop partitions older than _retentionDays.
-    /// Each partition is a child table of mseed_records named mseed_records_YYYYMMDD.
-    /// Dropping a partition from a partitioned table is fast (DDL, not DML).
+    /// Hybrid strategy:
+    ///   - Partitions whose ENTIRE day range is before the cutoff timestamp
+    ///     → DROP TABLE (fast DDL, no scan needed)
+    ///   - The boundary partition (the day containing the cutoff timestamp)
+    ///     → DELETE WHERE start_time &lt; @cutoff (precise, time-based FIFO)
+    ///
+    /// Example: retentionDays=1, now=2026-07-10 14:00 UTC
+    ///   Cutoff  = 2026-07-09 14:00 UTC
+    ///   DROP    → mseed_records_20260708 and earlier (entirely expired)
+    ///   DELETE  → rows in mseed_records_20260709 WHERE start_time &lt; 2026-07-09 14:00
+    ///   KEEP    → rows in mseed_records_20260709 WHERE start_time &gt;= 2026-07-09 14:00
     /// </summary>
     public void PruneOldPartitions()
     {
@@ -284,46 +442,89 @@ public class MseedArchive : IDisposable
 
         try
         {
-            var cutoffDate = DateTime.UtcNow.Date.AddDays(-_retentionDays);
+            var now = DateTime.UtcNow;
+            var cutoff = now.AddDays(-_retentionDays);
+            var cutoffDate = cutoff.Date;
             var cutoffPartition = $"mseed_records_{cutoffDate:yyyyMMdd}";
 
             using var conn = _dataSource.OpenConnection();
-            using var cmd = conn.CreateCommand();
 
-            // Find all daily partitions older than cutoff
-            cmd.CommandText = @"
-                SELECT relname
-                FROM pg_class
-                WHERE relname ~ '^mseed_records_[0-9]{8}$'
-                  AND relkind = 'r'
-                  AND relispartition = true
-                  AND relname <= @cutoff
-                ORDER BY relname;
-            ";
-            cmd.Parameters.AddWithValue("cutoff", cutoffPartition);
-
-            var partitionsToDrop = new List<string>();
-            using var reader = cmd.ExecuteReader();
-            while (reader.Read())
+            // Phase 1: Drop partitions entirely before the cutoff day.
+            // These contain only expired data → DROP is safe and fast.
+            using (var cmd = conn.CreateCommand())
             {
-                partitionsToDrop.Add(reader.GetString(0));
-            }
-            reader.Close();
+                cmd.CommandText = @"
+                    SELECT relname
+                    FROM pg_class
+                    WHERE relname ~ '^mseed_records_[0-9]{8}$'
+                      AND relkind = 'r'
+                      AND relispartition = true
+                      AND relname < @cutoffPartition
+                    ORDER BY relname;
+                ";
+                cmd.Parameters.AddWithValue("cutoffPartition", cutoffPartition);
 
-            if (partitionsToDrop.Count == 0) return;
+                var toDrop = new List<string>();
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                    toDrop.Add(reader.GetString(0));
+                reader.Close();
 
-            foreach (var partition in partitionsToDrop)
-            {
-                try
+                foreach (var part in toDrop)
                 {
-                    using var dropCmd = conn.CreateCommand();
-                    dropCmd.CommandText = $"DROP TABLE IF EXISTS {partition}";
-                    dropCmd.ExecuteNonQuery();
-                    Logging.lprintf(1, "MseedArchive: pruned old partition {0}", partition);
+                    try
+                    {
+                        using var dropCmd = conn.CreateCommand();
+                        dropCmd.CommandText = $"DROP TABLE IF EXISTS {part}";
+                        dropCmd.ExecuteNonQuery();
+                        Logging.lprintf(1, "MseedArchive: pruned partition {0} (entirely expired)", part);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logging.lprintf(0, "MseedArchive: failed to prune partition {0}: {1}", part, ex.Message);
+                    }
                 }
-                catch (Exception ex)
+            }
+
+            // Phase 2: Precision-delete expired rows from the boundary partition.
+            // This partition straddles the cutoff — only some rows are expired.
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = @"
+                    SELECT relname
+                    FROM pg_class
+                    WHERE relname = @cutoffPartition
+                      AND relkind = 'r'
+                      AND relispartition = true;
+                ";
+                cmd.Parameters.AddWithValue("cutoffPartition", cutoffPartition);
+
+                var exists = cmd.ExecuteScalar() != null;
+                if (exists)
                 {
-                    Logging.lprintf(0, "MseedArchive: failed to prune partition {0}: {1}", partition, ex.Message);
+                    using var delCmd = conn.CreateCommand();
+                    delCmd.CommandText = "DELETE FROM mseed_records WHERE start_time < @cutoff";
+                    delCmd.Parameters.AddWithValue("cutoff", cutoff);
+                    int deleted = delCmd.ExecuteNonQuery();
+
+                    if (deleted > 0)
+                    {
+                        Logging.lprintf(1, "MseedArchive: deleted {0} expired rows from {1} (cutoff={2:yyyy-MM-dd HH:mm})",
+                            deleted, cutoffPartition, cutoff);
+                    }
+
+                    // If the partition is now empty after the DELETE, drop it too
+                    using var countCmd = conn.CreateCommand();
+                    countCmd.CommandText = $"SELECT COUNT(*) FROM {cutoffPartition}";
+                    long remaining = (long)(countCmd.ExecuteScalar() ?? 0L);
+
+                    if (remaining == 0)
+                    {
+                        using var dropCmd = conn.CreateCommand();
+                        dropCmd.CommandText = $"DROP TABLE IF EXISTS {cutoffPartition}";
+                        dropCmd.ExecuteNonQuery();
+                        Logging.lprintf(1, "MseedArchive: dropped empty boundary partition {0}", cutoffPartition);
+                    }
                 }
             }
         }
@@ -432,6 +633,18 @@ public class MseedArchive : IDisposable
             }
         }
 
+        // Phase 1.5: Ensure daily partitions exist for all records in the batch.
+        // Without this, COPY silently fails when start_time falls on a day
+        // that has no partition — PostgreSQL rejects rows that don't match
+        // any partition range.
+        {
+            using var partConn = _dataSource.OpenConnection();
+            foreach (var record in records)
+            {
+                EnsurePartition(partConn, NsTimeToDateTime(record.StartTime).Date);
+            }
+        }
+
         // Phase 2: Binary COPY with all IDs already resolved
         using var conn = _dataSource.OpenConnection();
         using var writer = conn.BeginBinaryImport(
@@ -459,6 +672,11 @@ public class MseedArchive : IDisposable
         writer.Complete();
 
         Logging.lprintf(3, "MseedArchive: flushed {0} records", records.Count);
+
+        // Inline circular-buffer eviction: every write triggers a lightweight
+        // prune of expired data.  Throttled to at most once per 30s so we
+        // don't run a DELETE on every single batch flush.
+        InlineEvictExpired();
     }
 
     /// <summary>
@@ -594,6 +812,100 @@ public class MseedArchive : IDisposable
         {
             var endDt = NsTimeToDateTime(endTime);
             cmd.Parameters.AddWithValue("end_time", endDt);
+        }
+
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            results.Add(new MseedQueryResult
+            {
+                Id = reader.GetInt64(0),
+                StreamId = reader.GetString(1),
+                StartTime = DateTimeToNsTime(reader.GetDateTime(2)),
+                EndTime = DateTimeToNsTime(reader.GetDateTime(3)),
+                SampleRate = reader.IsDBNull(4) ? 0f : reader.GetFloat(4),
+                DataSize = (uint)reader.GetInt32(5),
+                RawData = reader.IsDBNull(6) ? null : (byte[])reader[6],
+                PktId = reader.IsDBNull(7) ? 0 : (ulong)reader.GetInt64(7)
+            });
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Query with composite pagination cursor (start_time, id).
+    /// Unlike QueryByTime which uses a simple >= start_time filter that can
+    /// skip records from other stations when a batch boundary lands between
+    /// interleaved multi-station results, this uses (start_time, id) tuples
+    /// so NO record is ever skipped regardless of batch size.
+    /// </summary>
+    public List<MseedQueryResult> QueryByTimePagination(
+        List<string> streamIds,
+        NsTime startTime, NsTime endTime,
+        NsTime cursorStartTime, long cursorId,
+        int limit = 10000)
+    {
+        var results = new List<MseedQueryResult>();
+
+        using var conn = _dataSource.OpenConnection();
+        using var cmd = conn.CreateCommand();
+
+        var sql = new StringBuilder();
+        sql.AppendLine("SELECT mr.id, s.stream_id, mr.start_time, mr.end_time,");
+        sql.AppendLine("       mr.sample_rate, mr.data_size, mr.raw_data, mr.pkt_id");
+        sql.AppendLine("FROM mseed_records mr");
+        sql.AppendLine("JOIN stations s ON s.id = mr.station_id");
+        sql.AppendLine("WHERE mr.start_time >= @start_time");
+
+        if (!endTime.IsUnset)
+            sql.AppendLine("  AND mr.start_time <= @end_time");
+
+        // Composite cursor: (start_time > cursor_time) OR (start_time = cursor_time AND id > cursor_id)
+        // This ensures NO records are skipped, even when batch boundaries split
+        // interleaved multi-station results.
+        if (!cursorStartTime.IsUnset && cursorId > 0)
+        {
+            sql.AppendLine("  AND ((mr.start_time > @cursor_time)");
+            sql.AppendLine("       OR (mr.start_time = @cursor_time AND mr.id > @cursor_id))");
+        }
+
+        if (streamIds.Count == 1 && streamIds[0] == "%")
+        {
+            // All streams — no additional filter
+        }
+        else if (streamIds.Count > 0)
+        {
+            var likeClauses = new List<string>();
+            for (int i = 0; i < streamIds.Count; i++)
+            {
+                string param = $"@stream_{i}";
+                string escaped = streamIds[i].Replace("_", "\\_");
+                likeClauses.Add($"s.stream_id LIKE {param} ESCAPE '\\'");
+                cmd.Parameters.AddWithValue($"stream_{i}", escaped);
+            }
+            sql.AppendLine($"  AND ({string.Join(" OR ", likeClauses)})");
+        }
+
+        sql.AppendLine("ORDER BY mr.start_time ASC, mr.id ASC");
+        sql.AppendLine($"LIMIT {limit}");
+
+        cmd.CommandText = sql.ToString();
+
+        var startDt = NsTimeToDateTime(startTime);
+        cmd.Parameters.AddWithValue("start_time", startDt);
+
+        if (!endTime.IsUnset)
+        {
+            var endDt = NsTimeToDateTime(endTime);
+            cmd.Parameters.AddWithValue("end_time", endDt);
+        }
+
+        if (!cursorStartTime.IsUnset && cursorId > 0)
+        {
+            var cursorDt = NsTimeToDateTime(cursorStartTime);
+            cmd.Parameters.AddWithValue("cursor_time", cursorDt);
+            cmd.Parameters.AddWithValue("cursor_id", cursorId);
         }
 
         using var reader = cmd.ExecuteReader();

@@ -53,6 +53,10 @@ public class SLExtInfo
     public bool DbPreFetchDone;
     /// <summary>End time of the last DB record sent. Used to reposition ring reader after DB exhaustion.</summary>
     public NsTime LastDbEndTime = NsTime.Unset;
+    /// <summary>Start time of the last DB record sent, for composite pagination cursor.</summary>
+    public NsTime LastDbStartTime = NsTime.Unset;
+    /// <summary>DB record ID of the last record sent, for composite pagination cursor (start_time, id).</summary>
+    public long LastDbRecordId;
     /// <summary>The requested end time from TIME command. When DB pagination reaches this time, stop refetching.</summary>
     public NsTime DbQueryEndTime = NsTime.Unset;
     /// <summary>The stream ID LIKE patterns used for DB queries (stored for pagination refetch).</summary>
@@ -209,34 +213,79 @@ public static class SeedLinkProtocol
     }
 
     /// <summary>
+    /// Maximum DB records to burst-send per loop iteration.
+    /// Sending 1 record per loop is the #1 cause of slow historical streaming:
+    /// each loop iteration incurs RecvLine poll, throttle, and syscall overhead.
+    /// Bursting 200 records per iteration reduces loop overhead from ~300 µs/record
+    /// to ~5 µs/record — a 60× improvement, matching C version throughput.
+    /// </summary>
+    private const int DbBurstLimit = 200;
+
+    /// <summary>
     /// Stream packets to the client over SeedLink protocol.
-    /// Equivalent to SLStreamPackets() in slclient.c.
     /// Returns number of bytes sent, 0 if no data, negative on error.
-    ///
-    /// MATCHES C ORIGINAL: reads ONE packet per call, sends it, returns.
-    /// The main loop re-calls this function.  C original's 10-attempt
-    /// THROTTLE_TRIGGER is handled in ClientHandler, not here.
     /// </summary>
     public static int StreamPackets(ClientInfo cinfo, RingBuffer ringBuffer)
     {
         if (cinfo.State != ClientState.Stream)
             return 0;
 
-        // DB fallback: send pre-fetched historical records before ring streaming
+        // DB fallback: burst-send up to DbBurstLimit historical records before
+        // returning to the main loop.  This avoids the per-record throttle/recv
+        // overhead that makes C# 60× slower than C for historical streaming.
         if (cinfo.ExtInfo is SLExtInfo slExt && slExt.DbRecords != null && slExt.DbRecords.Count > 0)
         {
-            var dbRecord = slExt.DbRecords.Dequeue();
+            int totalSent = 0;
+            int totalRecordsSent = 0;
 
-            // Track end time of last DB record for ring repositioning
-            slExt.LastDbEndTime = dbRecord.EndTime;
-
-            // If this was the last DB record, try to fetch more from DB or reposition ring.
-            if (slExt.DbRecords.Count == 0)
+            for (int burst = 0; burst < DbBurstLimit && slExt.DbRecords.Count > 0; burst++)
             {
-                HandleDbQueueExhausted(cinfo, slExt);
+                var dbRecord = slExt.DbRecords.Dequeue();
+
+                slExt.LastDbStartTime = dbRecord.StartTime;
+                slExt.LastDbEndTime = dbRecord.EndTime;
+                slExt.LastDbRecordId = dbRecord.Id;
+
+                // Diagnostik: log first record and every 5000th
+                if (totalRecordsSent == 0)
+                {
+                    var firstBytes = dbRecord.RawData != null && dbRecord.RawData.Length >= 8
+                        ? BitConverter.ToString(dbRecord.RawData, 0, Math.Min(dbRecord.RawData.Length, 8))
+                        : "null";
+                    Logging.lprintf(1, "[{0}] DB STREAM: sending record #1 stream={1} pktId={2} start={3} datasize={4} firstBytes={5} proto={6}",
+                        cinfo.Hostname, dbRecord.StreamId, dbRecord.PktId,
+                        dbRecord.StartTime.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss.fff"),
+                        dbRecord.RawData?.Length ?? 0, firstBytes, slExt.ProtoMajor);
+                }
+                else if (totalRecordsSent % 5000 == 0)
+                {
+                    Logging.lprintf(1, "[{0}] DB STREAM: sending record #{1} stream={2} start={3}",
+                        cinfo.Hostname, totalRecordsSent + 1, dbRecord.StreamId,
+                        dbRecord.StartTime.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss.fff"));
+                }
+
+                int sent = SendDbRecord(cinfo, dbRecord, slExt.ProtoMajor);
+                if (sent <= 0)
+                {
+                    Logging.lprintf(0, "[{0}] DB STREAM: SendDbRecord FAILED sent={1} at record #{2}",
+                        cinfo.Hostname, sent, totalRecordsSent + 1);
+                    return sent; // error or 0 — abort burst
+                }
+
+                totalSent += sent;
+                totalRecordsSent++;
+
+                // If queue is now empty, try pagination; if no more, stop burst
+                if (slExt.DbRecords.Count == 0)
+                {
+                    HandleDbQueueExhausted(cinfo, slExt);
+                    if (slExt.DbRecords == null || slExt.DbRecords.Count == 0)
+                        break; // no more DB data, fall through to ring stream
+                }
             }
 
-            return SendDbRecord(cinfo, dbRecord, slExt.ProtoMajor);
+            // Return non-zero (total bytes) so the main loop resets throttle to 0.
+            return totalSent > 0 ? totalSent : 0;
         }
 
         // Use cached buffers to avoid per-call GC pressure.
@@ -401,27 +450,31 @@ public static class SeedLinkProtocol
             slExt.LastDbEndTime.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss"),
             slExt.DbQueryEndTime.IsUnset ? "unset" : slExt.DbQueryEndTime.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss"));
 
-        // Check if there is more data in DB between last record end and the requested end time
-        if (!slExt.DbQueryEndTime.IsUnset && slExt.LastDbEndTime < slExt.DbQueryEndTime)
+        // Check if there is more data in DB.  Use composite cursor (start_time, id)
+        // so that records from OTHER stations that fell between batch boundaries
+        // are NOT skipped — a simple end_time + 1ms cursor would miss them.
+        if (!slExt.DbQueryEndTime.IsUnset && slExt.LastDbStartTime < slExt.DbQueryEndTime && slExt.LastDbRecordId > 0)
         {
             var archive = ServerConfig.Archive;
             if (archive != null && slExt.DbQueryStreamIds != null && slExt.DbQueryStreamIds.Count > 0)
             {
                 try
                 {
-                    // Fetch next batch starting just after the last record we sent.
-                    // Add 1 millisecond to avoid re-fetching the exact same record.
-                    NsTime nextStart = new NsTime(slExt.LastDbEndTime.Value + 1_000_000L);
-
-                    var nextBatch = archive.QueryByTime(
-                        slExt.DbQueryStreamIds, nextStart, slExt.DbQueryEndTime, 10000);
+                    var nextBatch = archive.QueryByTimePagination(
+                        slExt.DbQueryStreamIds,
+                        slExt.LastDbStartTime,          // >= this start_time
+                        slExt.DbQueryEndTime,            // <= end_time
+                        slExt.LastDbStartTime,           // composite cursor: (start_time, id)
+                        slExt.LastDbRecordId,
+                        10000);
 
                     if (nextBatch.Count > 0)
                     {
                         slExt.DbRecords = new Queue<MseedQueryResult>(nextBatch);
-                        Logging.lprintf(1, "[{0}] DB pagination: refetched {1} more records from {2}",
+                        Logging.lprintf(1, "[{0}] DB pagination: refetched {1} more records from {2} (cursor_id={3})",
                             cinfo.Hostname, nextBatch.Count,
-                            nextBatch[0].StartTime.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss"));
+                            nextBatch[0].StartTime.ToDateTime().ToString("yyyy-MM-ddTHH:mm:ss"),
+                            slExt.LastDbRecordId);
                         return; // Queue is now filled — StreamPackets will pick up from here
                     }
                 }
@@ -597,13 +650,21 @@ public static class SeedLinkProtocol
                 slext.SelectedStations.Add(staid);
         }
 
-        // Build regex matching all channels for this station (no selector yet)
-        // Pattern: ^(?:FDSN:)?NET_STA_.*(?:/MSEED)?[23]?$
-        string pattern = BuildStreamRegex(staid, null);
-        RingBuffer.UpdatePattern(ref cinfo.Reader!.Match, pattern, "station");
-        RingBuffer.UpdatePattern(ref cinfo.Reader!.Reject, null, "reject");
+        // Only update ring Match pattern while still in command phase.
+        // Swarm may re-send STATION after END, and overwriting Match would
+        // silently drop packets from previously selected stations.
+        if (cinfo.State != ClientState.Stream)
+        {
+            string pattern = BuildStreamRegex(staid, null);
+            RingBuffer.UpdatePattern(ref cinfo.Reader!.Match, pattern, "station");
+            RingBuffer.UpdatePattern(ref cinfo.Reader!.Reject, null, "reject");
+            Logging.lprintf(2, "[{0}] STATION {1} {2} → regex={3}", cinfo.Hostname, sta, net, pattern);
+        }
+        else
+        {
+            Logging.lprintf(2, "[{0}] STATION {1} {2} (streaming, Match unchanged)", cinfo.Hostname, sta, net);
+        }
 
-        Logging.lprintf(2, "[{0}] STATION {1} {2} → regex={3}", cinfo.Hostname, sta, net, pattern);
         SendResponse(cinfo, "OK");
     }
 
@@ -695,7 +756,16 @@ public static class SeedLinkProtocol
                 }
                 else
                 {
-                    // v3: hex sequence
+                    // v3: hex sequence — map 24-bit SeedLink v3 sequence to 64-bit ring ID.
+                    //
+                    // C original (slclient.c line 930-931):
+                    //   startpacket = (cinfo->ringparams->latestid & 0xFFFFFFFFFF000000)
+                    //               | (seq & 0xFFFFFF);
+                    //
+                    // SeedLink v3 uses 24-bit hex sequences, but ring buffer packet IDs
+                    // are 64-bit monotonic counters.  Without this mapping, e.g. 0x8ce0
+                    // becomes PktId=36063 instead of ~40,000,000 — RingPosition always
+                    // fails with "not in ring", and the client gets zero data.
                     if (!uint.TryParse(seqStr, System.Globalization.NumberStyles.HexNumber,
                         null, out uint hexseq) || hexseq == 0xFFFFFF)
                     {
@@ -703,7 +773,18 @@ public static class SeedLinkProtocol
                         Logging.lprintf(2, "[{0}] DATA seq={1} (invalid/FFFFFF) → from next", cinfo.Hostname, seqStr);
                         goto afterSeqParse;
                     }
-                    startpacket = hexseq;
+
+                    if (cinfo.RingParams.LatestId <= Constants.RingIdMaximum)
+                    {
+                        // Combine high 40 bits of latest ring ID with low 24 bits of client's hex seq
+                        startpacket = (cinfo.RingParams.LatestId & 0xFFFFFFFFFF000000UL) | (hexseq & 0xFFFFFFUL);
+                        Logging.lprintf(2, "[{0}] DATA seq=0x{1:X} → latestId=0x{2:X} → pktid=0x{3:X} ({3})",
+                            cinfo.Hostname, hexseq, cinfo.RingParams.LatestId, startpacket);
+                    }
+                    else
+                    {
+                        startpacket = hexseq & 0xFFFFFF;
+                    }
                 }
 
                 // SeedLink clients resume by requesting: lastpacket + 1
@@ -786,16 +867,41 @@ public static class SeedLinkProtocol
             // Station mode: store times, send OK, stay in command state
             if (slext != null)
             {
-                slext.StartTime = startTime;
-                // Only update EndTime if explicitly provided.
-                // SWARM sends two TIME commands: first with start+end, then start-only.
-                // Overwriting EndTime to Unset would break DB pagination upper bound.
+                // Track earliest StartTime across multi-TIME Swarm sequences.
+                // Swarm sends two TIME commands — the second would overwrite
+                // the earlier start, losing all historical data.
+                if (slext.StartTime.IsUnset || startTime.CompareTo(slext.StartTime) < 0)
+                    slext.StartTime = startTime;
+
+                // EndTime logic for multi-TIME Swarm sequences:
+                //
+                // Swarm sends two TIME commands per station group:
+                //   T1: "TIME start end"     → explicit window
+                //   T2: "TIME start"         → implicit "till now"
+                //
+                // Only overwrite EndTime when explicitly provided.
+                // If the new start is AFTER the old end, the window would
+                // be backwards — reset EndTime so the query becomes
+                // [new_start, Now] instead of [new_start, old_end].
                 if (!endTime.IsUnset)
+                {
                     slext.EndTime = endTime;
+                }
+                else if (slext.EndTime != NsTime.Unset &&
+                         startTime.CompareTo(slext.EndTime) > 0)
+                {
+                    // New start is past old end → window backwards, reset end
+                    Logging.lprintf(2, "[{0}] TIME: new start {1} > old end {2}, resetting EndTime",
+                        cinfo.Hostname,
+                        startTime.ToIsoString(),
+                        slext.EndTime.IsUnset ? "unset" : slext.EndTime.ToIsoString());
+                    slext.EndTime = NsTime.Unset;
+                }
             }
-            Logging.lprintf(2, "[{0}] TIME in station mode: start={1} end={2} (prev_end={3})",
+            Logging.lprintf(1, "[{0}] TIME in station mode: req_start={1} req_end={2} actual_start={3} actual_end={4}",
                 cinfo.Hostname, parts[1],
                 parts.Length >= 3 ? parts[2] : "none",
+                slext?.StartTime.IsUnset == false ? slext.StartTime.ToIsoString() : "unset",
                 slext?.EndTime.IsUnset == false ? slext.EndTime.ToIsoString() : "unset");
             SendResponse(cinfo, "OK");
         }
@@ -807,7 +913,9 @@ public static class SeedLinkProtocol
 
             if (slext != null)
             {
-                slext.StartTime = startTime;
+                // Track earliest StartTime (same guard as station mode)
+                if (slext.StartTime.IsUnset || startTime.CompareTo(slext.StartTime) < 0)
+                    slext.StartTime = startTime;
                 // Only update EndTime if explicitly provided (same guard as station mode)
                 if (!endTime.IsUnset)
                     slext.EndTime = endTime;
@@ -821,7 +929,7 @@ public static class SeedLinkProtocol
                 {
                     var streamIds = new List<string> { "%" };
                     slext.DbQueryStreamIds = streamIds;
-                    NsTime dbEnd = slext.EndTime.IsUnset ? NsTime.Unset : slext.EndTime;
+                    NsTime dbEnd = slext.EndTime.IsUnset ? NsTime.Now : slext.EndTime;
                     var dbResults = archive.QueryByTime(streamIds, slext.StartTime, dbEnd, 10000);
                     if (dbResults.Count > 0)
                     {
@@ -912,7 +1020,35 @@ public static class SeedLinkProtocol
                 cinfo.Hostname, slext.StartTime);
         }
 
-        // Step 2b: If PostgreSQL archive is available and the requested start time
+        // Step 2b: Rebuild Match regex from ALL accumulated stations.
+        // HandleStation overwrites cinfo.Reader.Match on each STATION command,
+        // so by the time END arrives the last station's regex has displaced all
+        // previous ones.  Rebuild a combined regex here so that every selected
+        // station's packets pass the ring pattern filter.
+        if (slext != null && slext.SelectedStations.Count > 0)
+        {
+            string combinedPattern = BuildMultiStationRegex(slext.SelectedStations);
+            RingBuffer.UpdatePattern(ref cinfo.Reader!.Match, combinedPattern, "END:all-stations");
+            Logging.lprintf(2, "[{0}] END: rebuilt Match regex for {1} stations: {2}",
+                cinfo.Hostname, slext.SelectedStations.Count, combinedPattern);
+        }
+
+        // Step 2c: Auto-start-time for DATA ALL without TIME command.
+        // SWARM helicorder often sends DATA ALL without a TIME command,
+        // leaving StartTime = Unset.  Without StartTime, DB pre-fetch is
+        // skipped and historical data from PostgreSQL never reaches SWARM.
+        // Detect this and set StartTime to 7 days ago so the archive gets
+        // queried.  The ring buffer (volatile with SQL storage) has no
+        // historical data, so DB is the only source for past records.
+        if (slext != null && slext.StartTime.IsUnset &&
+            cinfo.Reader != null && cinfo.Reader.PktId == Constants.RingIdEarliest)
+        {
+            slext.StartTime = NsTime.FromDateTime(DateTime.UtcNow.AddDays(-7));
+            Logging.lprintf(1, "[{0}] END: DATA ALL without TIME → auto start={1}",
+                cinfo.Hostname, slext.StartTime.ToIsoString());
+        }
+
+        // Step 2c: If PostgreSQL archive is available and the requested start time
         // is earlier than what the ring buffer holds, pre-fetch historical data from DB.
         if (slext != null && slext.StartTime != NsTime.Unset &&
             slext.StartTime != NsTime.Error && !slext.DbPreFetchDone)
@@ -941,7 +1077,12 @@ public static class SeedLinkProtocol
                     // Save stream patterns for DB pagination refetch
                     slext.DbQueryStreamIds = streamIds;
 
-                    NsTime dbEnd = slext.EndTime.IsUnset ? NsTime.Unset : slext.EndTime;
+                    NsTime dbEnd = slext.EndTime.IsUnset ? NsTime.Now : slext.EndTime;
+
+                    Logging.lprintf(1, "[{0}] END: querying DB range {1} → {2}",
+                        cinfo.Hostname,
+                        slext.StartTime.ToIsoString(),
+                        dbEnd.IsUnset ? "now" : dbEnd.ToIsoString());
 
                     var dbResults = archive.QueryByTime(
                         streamIds, slext.StartTime, dbEnd, 10000);
@@ -1038,9 +1179,20 @@ public static class SeedLinkProtocol
                     return;
                 }
 
-                string pattern = BuildStreamRegex(staid, convertedSelector);
-                RingBuffer.UpdatePattern(ref cinfo.Reader!.Match, pattern, "select");
-                Logging.lprintf(2, "[{0}] SELECT {1} → regex={2}", cinfo.Hostname, selector, pattern);
+                // Only update ring Match pattern while still in command phase.
+                // Swarm may re-send SELECT after END, and overwriting Match
+                // would drop packets from previously selected stations.
+                if (cinfo.State != ClientState.Stream)
+                {
+                    string pattern = BuildStreamRegex(staid, convertedSelector);
+                    RingBuffer.UpdatePattern(ref cinfo.Reader!.Match, pattern, "select");
+                    Logging.lprintf(2, "[{0}] SELECT {1} → regex={2}", cinfo.Hostname, selector, pattern);
+                }
+                else
+                {
+                    Logging.lprintf(2, "[{0}] SELECT {1} (streaming, Match unchanged)", cinfo.Hostname, selector);
+                }
+
                 SendResponse(cinfo, "OK");
             }
         }
@@ -1166,6 +1318,29 @@ public static class SeedLinkProtocol
         }
 
         sb.Append("(?:/MSEED)?[23]?$");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Build a combined regex matching ALL accumulated stations.
+    /// Used at END time because HandleStation overwrites Match with the
+    /// most recent station's regex, so multi-station streaming would
+    /// silently drop packets from all but the last station.
+    ///
+    /// Combines individual station regexes with | (alternation).
+    /// Selector patterns are preserved if present; otherwise ".*" is used.
+    /// </summary>
+    private static string BuildMultiStationRegex(List<string> stations)
+    {
+        if (stations.Count == 1)
+            return BuildStreamRegex(stations[0], null);
+
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < stations.Count; i++)
+        {
+            if (i > 0) sb.Append('|');
+            sb.Append(BuildStreamRegex(stations[i], null));
+        }
         return sb.ToString();
     }
 

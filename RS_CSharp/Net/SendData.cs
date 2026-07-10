@@ -16,6 +16,8 @@
  * Ported to C# from original C code by Chad Trabant, EarthScope Data Services
  **************************************************************************/
 
+using System;
+using System.Collections.Generic;
 using System.Net.Sockets;
 using RingServer.Types;
 
@@ -54,25 +56,40 @@ public static class SendData
         for (int i = 0; i < bufcount; i++)
             totalbuflen += lengths[i];
 
-        // Build complete data block
-        byte[] data = new byte[totalbuflen];
-        int offset = 0;
-        for (int i = 0; i < bufcount; i++)
-        {
-            Buffer.BlockCopy(buffers[i], 0, data, offset, lengths[i]);
-            offset += lengths[i];
-        }
-
         try
         {
             // Set socket to blocking for send
             cinfo.Socket.Blocking = true;
 
-            // Send all data
+            // Use gather-write (Socket.Send with IList<ArraySegment<byte>>) to
+            // avoid allocating a concatenated buffer + Buffer.BlockCopy.
+            // This sends all buffer segments in a single syscall without copying.
+            var segments = new ArraySegment<byte>[bufcount];
+            for (int i = 0; i < bufcount; i++)
+                segments[i] = new ArraySegment<byte>(buffers[i], 0, lengths[i]);
+
             int totalSent = 0;
-            while (totalSent < data.Length)
+            while (totalSent < totalbuflen)
             {
-                int sent = cinfo.Socket.Send(data, totalSent, data.Length - totalSent, SocketFlags.None);
+                // Build send-offset-adjusted segments for partial sends
+                int offset = 0;
+                var sendSegments = new List<ArraySegment<byte>>(bufcount);
+                for (int i = 0; i < bufcount; i++)
+                {
+                    int segEnd = offset + lengths[i];
+                    if (segEnd > totalSent)
+                    {
+                        int start = Math.Max(0, totalSent - offset);
+                        int count = Math.Min(lengths[i] - start, segEnd - totalSent);
+                        if (count > 0)
+                            sendSegments.Add(new ArraySegment<byte>(buffers[i], start, count));
+                    }
+                    offset = segEnd;
+                }
+
+                if (sendSegments.Count == 0) break;
+
+                int sent = cinfo.Socket.Send(sendSegments, SocketFlags.None);
                 if (sent <= 0)
                 {
                     cinfo.SocketErr = -1;

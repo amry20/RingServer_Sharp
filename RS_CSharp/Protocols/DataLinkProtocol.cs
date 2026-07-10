@@ -32,6 +32,12 @@ namespace RingServer.Protocols;
 public class DLExtInfo
 {
     public Regex? LegacyMseedStreamIdMatch;
+    /// <summary>Cached RingPacket for StreamPackets (avoid per-call GC allocations).</summary>
+    internal RingPacket? CachedPacket;
+    /// <summary>Cached packet data buffer for StreamPackets.</summary>
+    internal byte[]? CachedPacketData;
+    /// <summary>Cached size of the packet data buffer.</summary>
+    internal int CachedPacketDataSize;
 }
 
 public static class DataLinkProtocol
@@ -659,21 +665,46 @@ public static class DataLinkProtocol
     {
         if (cinfo.State != ClientState.Stream) return 0;
         int sent = 0;
+
+        // Use cached buffers to avoid per-call GC pressure.
+        // Same pattern as SeedLinkProtocol.StreamPackets — see discussion there.
+        var dlExt = cinfo.ExtInfo as DLExtInfo;
+        int packetDataSize = (int)(cinfo.RingParams.PktSize - RingPacket.SerializedSize);
+
+        RingPacket packet;
+        byte[] packetData;
+
+        if (dlExt?.CachedPacket != null && dlExt.CachedPacketData != null &&
+            dlExt.CachedPacketDataSize == packetDataSize)
+        {
+            packet = dlExt.CachedPacket;
+            packetData = dlExt.CachedPacketData;
+        }
+        else
+        {
+            packet = new RingPacket();
+            packetData = new byte[packetDataSize];
+            if (dlExt != null)
+            {
+                dlExt.CachedPacket = packet;
+                dlExt.CachedPacketData = packetData;
+                dlExt.CachedPacketDataSize = packetDataSize;
+            }
+        }
+
         for (int i = 0; i < 10; i++)
         {
-            var p = new RingPacket();
-            int ds = (int)(cinfo.RingParams.PktSize - RingPacket.SerializedSize);
-            var d = new byte[ds];
-            ulong readId = ringBuffer.ReadNext(cinfo.Reader!, p, d);
+            Array.Clear(packetData, 0, packetData.Length);
+            ulong readId = ringBuffer.ReadNext(cinfo.Reader!, packet, packetData);
             if (readId == Constants.RingIdError) return -1;
             if (readId == Constants.RingIdNone) break;
 
-            int ts = RingPacket.SerializedSize + (int)p.DataSize;
+            int ts = RingPacket.SerializedSize + (int)packet.DataSize;
             byte[] op = new byte[ts];
-            p.Serialize(op.AsSpan());
-            if (p.DataSize > 0) Buffer.BlockCopy(d, 0, op, RingPacket.SerializedSize, (int)p.DataSize);
+            packet.Serialize(op.AsSpan());
+            if (packet.DataSize > 0) Buffer.BlockCopy(packetData, 0, op, RingPacket.SerializedSize, (int)packet.DataSize);
             
-            int rv = SendPacket(cinfo, $"PACKET {p.StreamId} {p.PktId} {p.PktTime.Value / 1000} {p.DataStart.Value / 1000} {p.DataEnd.Value / 1000} {p.DataSize}", op, 0, false, false);
+            int rv = SendPacket(cinfo, $"PACKET {packet.StreamId} {packet.PktId} {packet.PktTime.Value / 1000} {packet.DataStart.Value / 1000} {packet.DataEnd.Value / 1000} {packet.DataSize}", op, 0, false, false);
             if (rv < 0) return rv;
             sent += ts;
         }

@@ -54,6 +54,19 @@ public static class Program
         if (ConfigProcessor.ProcessParam(args) < 0)
             return 1;
 
+        // Auto-detect ring.conf in current directory if no config file was specified
+        if (config.ConfigFile == null)
+        {
+            string defaultConf = Path.Combine(AppContext.BaseDirectory, "ring.conf");
+            if (File.Exists(defaultConf))
+            {
+                Logging.lprintf(1, "Auto-detected config file: {0}", defaultConf);
+                config.ConfigFile = defaultConf;
+                if (ConfigProcessor.ReadConfigFile(defaultConf, false) < 0)
+                    return 1;
+            }
+        }
+
         // Signal handling using .NET's Console.CancelKeyPress
         Console.CancelKeyPress += (sender, e) =>
         {
