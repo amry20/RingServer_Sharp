@@ -1510,12 +1510,11 @@ PollSocket (int socket, int readability, int writability, int timeout_ms)
   if (writability)
     pfd.events |= POLLOUT;
 
-  /* Quick check with no timeout to avoid timer setup if not needed */
-  int quick_result = poll (&pfd, 1, 0);
-  if (quick_result > 0)
-    return quick_result;
-
-  /* Poll with timeout */
+  /* Single poll call handles both immediate readiness and timeout.
+   * Previous code did poll(0) then poll(timeout) — 2 syscalls every cycle.
+   * At 1000 clients polling frequently, eliminating one syscall per cycle
+   * saves ~50% of poll overhead.  poll() returns immediately when the
+   * socket is already ready, so the quick-check was redundant. */
   return poll (&pfd, 1, timeout_ms);
 } /* End of PollSocket() */
 

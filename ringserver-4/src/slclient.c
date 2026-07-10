@@ -2189,8 +2189,19 @@ SendPacket (uint64_t pktid, char *payload, uint32_t payloadlen,
   else /* Create v3 header */
   {
     /* Create v3 SeedLink header: signature + sequence number
-     * Use ony the lowest 24-bits of pktid, maximum allowed in v3 sequence */
-    snprintf (header, sizeof (header), "SL%06X", (uint32_t)(pktid & 0xFFFFFF));
+     * Use only the lowest 24-bits of pktid, maximum allowed in v3 sequence.
+     * Fast inline hex conversion avoids snprintf() overhead on the hot path.
+     * At 1000 clients × 100 pkts/sec = 100k calls/sec, this matters. */
+    static const char hex[] = "0123456789ABCDEF";
+    uint32_t seq = (uint32_t)(pktid & 0xFFFFFF);
+    header[0] = 'S';
+    header[1] = 'L';
+    header[2] = hex[(seq >> 20) & 0xF];
+    header[3] = hex[(seq >> 16) & 0xF];
+    header[4] = hex[(seq >> 12) & 0xF];
+    header[5] = hex[(seq >>  8) & 0xF];
+    header[6] = hex[(seq >>  4) & 0xF];
+    header[7] = hex[ seq        & 0xF];
     headerlen = SLHEADSIZE_V3;
   }
 

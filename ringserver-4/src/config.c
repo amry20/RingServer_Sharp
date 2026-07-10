@@ -2700,6 +2700,18 @@ InitServerSocket (char *portstr, ListenOptions options)
     goto cleanup;
   }
 
+  /* Allow multiple listen threads to share the same port.
+   * The kernel load-balances incoming connections across them,
+   * eliminating accept() serialization under high connect rates.
+   * Non-fatal: falls back to single-acceptor if unsupported. */
+#ifdef SO_REUSEPORT
+  if (setsockopt (fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof (optval)))
+  {
+    lprintf (2, "Note: SO_REUSEPORT not available, %s port %s: %s",
+             familystr, portstr, strerror (errno));
+  }
+#endif
+
   /* Limit IPv6 sockets to IPv6 only, avoid mapped addresses, we handle IPv4 separately */
   if (addr->ai_family == AF_INET6 &&
       setsockopt (fd, IPPROTO_IPV6, IPV6_V6ONLY, &optval, sizeof (optval)))
@@ -2716,7 +2728,13 @@ InitServerSocket (char *portstr, ListenOptions options)
     goto cleanup;
   }
 
-  if (listen (fd, 10) == -1)
+  /* Use a large listen backlog to absorb burst connection storms.
+   * SOMAXCONN (typically 4096 on modern Linux) lets the kernel queue
+   * many pending connections so they are not refused with ECONNREFUSED
+   * before the ListenThread can accept() them.  The previous value of
+   * 10 caused drops under simultaneous multi-client reconnect surges.
+   * Recommended sysctl: net.core.somaxconn=4096 */
+  if (listen (fd, SOMAXCONN) == -1)
   {
     lprintf (0, "Error with listen(), %s port %s: %s",
              familystr, portstr, strerror (errno));

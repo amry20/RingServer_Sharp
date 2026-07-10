@@ -1091,6 +1091,12 @@ RingReadNext (RingReader *reader, RingPacket *packet, char *packetdata)
   /* Determine the end-of-buffer offset as the one following the latest offset */
   eoboffset = NEXTOFFSET (latestoffset, param.maxoffset, config.pktsize);
 
+  /* Cache the match context once for the entire scan loop.
+   * GetMatchContext() calls pthread_once() which is fast (atomic check),
+   * but calling it 4× per packet across 1000+ clients adds up.
+   * A single local avoids those repeated function calls + atomics. */
+  pcre2_match_context *mctx = GetMatchContext ();
+
   /* Loop until we have a matching packet or reached the end of the buffer */
   skip    = 1;
   skipped = 0;
@@ -1135,25 +1141,25 @@ RingReadNext (RingReader *reader, RingPacket *packet, char *packetdata)
     /* Test allowed expression if available, skip if NOT matched */
     if (reader->allowed)
       if (pcre2_match (reader->allowed, (PCRE2_SPTR8)pkt->streamid, sidlen, 0, 0,
-                       reader->allowed_data, GetMatchContext ()) < 0)
+                       reader->allowed_data, mctx) < 0)
         skip = 1;
 
     /* Test forbidden expression if available, skip if matched */
     if (reader->forbidden && skip == 0)
       if (pcre2_match (reader->forbidden, (PCRE2_SPTR8)pkt->streamid, sidlen, 0, 0,
-                       reader->forbidden_data, GetMatchContext ()) >= 0)
+                       reader->forbidden_data, mctx) >= 0)
         skip = 1;
 
     /* Test match expression if available, skip if NOT matched */
     if (reader->match && skip == 0)
       if (pcre2_match (reader->match, (PCRE2_SPTR8)pkt->streamid, sidlen, 0, 0,
-                       reader->match_data, GetMatchContext ()) < 0)
+                       reader->match_data, mctx) < 0)
         skip = 1;
 
     /* Test reject expression if available, skip if matched */
     if (reader->reject && skip == 0)
       if (pcre2_match (reader->reject, (PCRE2_SPTR8)pkt->streamid, sidlen, 0, 0,
-                       reader->reject_data, GetMatchContext ()) >= 0)
+                       reader->reject_data, mctx) >= 0)
         skip = 1;
 
     /* If skipping this packet determine the next packet in the ring */
@@ -1324,6 +1330,9 @@ RingAfter (RingReader *reader, nstime_t reftime, int whence)
   /* Start searching with the earliest packet in the ring */
   offset = param.earliestoffset;
 
+  /* Cache match context for the scan loop */
+  pcre2_match_context *mctx = GetMatchContext ();
+
   /* Loop through packets in forward order */
   while (skipped < param.maxpackets)
   {
@@ -1343,25 +1352,25 @@ RingAfter (RingReader *reader, nstime_t reftime, int whence)
     /* Test allowed expression if available, skip if NOT matched */
     if (reader->allowed && !skip)
       if (pcre2_match (reader->allowed, (PCRE2_SPTR8)pkt1->streamid, sidlen, 0, 0,
-                       reader->allowed_data, GetMatchContext ()) < 0)
+                       reader->allowed_data, mctx) < 0)
         skip = 1;
 
     /* Test forbidden expression if available, skip if matched */
     if (reader->forbidden && !skip)
       if (pcre2_match (reader->forbidden, (PCRE2_SPTR8)pkt1->streamid, sidlen, 0, 0,
-                       reader->forbidden_data, GetMatchContext ()) >= 0)
+                       reader->forbidden_data, mctx) >= 0)
         skip = 1;
 
     /* Test match expression if available, skip if NOT matched */
     if (reader->match && !skip)
       if (pcre2_match (reader->match, (PCRE2_SPTR8)pkt1->streamid, sidlen, 0, 0,
-                       reader->match_data, GetMatchContext ()) < 0)
+                       reader->match_data, mctx) < 0)
         skip = 1;
 
     /* Test reject expression if available, skip if matched */
     if (reader->reject && !skip)
       if (pcre2_match (reader->reject, (PCRE2_SPTR8)pkt1->streamid, sidlen, 0, 0,
-                       reader->reject_data, GetMatchContext ()) >= 0)
+                       reader->reject_data, mctx) >= 0)
         skip = 1;
 
     /* Done if this matching packet has a data end time after that specified */
@@ -1465,6 +1474,9 @@ RingAfterRev (RingReader *reader, nstime_t reftime, uint64_t pktlimit,
   offset  = param.latestoffset;
   soffset = offset;
 
+  /* Cache match context for the scan loop */
+  pcre2_match_context *mctx = GetMatchContext ();
+
   /* Loop through packets in reverse order */
   while (count < pktlimit)
   {
@@ -1479,25 +1491,25 @@ RingAfterRev (RingReader *reader, nstime_t reftime, uint64_t pktlimit,
     /* Test allowed expression if available, skip if NOT matched */
     if (reader->allowed)
       if (pcre2_match (reader->allowed, (PCRE2_SPTR8)spkt->streamid, sidlen, 0, 0,
-                       reader->allowed_data, GetMatchContext ()) < 0)
+                       reader->allowed_data, mctx) < 0)
         skip = 1;
 
     /* Test forbidden expression if available, skip if matched */
     if (reader->forbidden && !skip)
       if (pcre2_match (reader->forbidden, (PCRE2_SPTR8)spkt->streamid, sidlen, 0, 0,
-                       reader->forbidden_data, GetMatchContext ()) >= 0)
+                       reader->forbidden_data, mctx) >= 0)
         skip = 1;
 
     /* Test match expression if available, skip if NOT matched */
     if (reader->match && !skip)
       if (pcre2_match (reader->match, (PCRE2_SPTR8)spkt->streamid, sidlen, 0, 0,
-                       reader->match_data, GetMatchContext ()) < 0)
+                       reader->match_data, mctx) < 0)
         skip = 1;
 
     /* Test reject expression if available, skip if matched */
     if (reader->reject && !skip)
       if (pcre2_match (reader->reject, (PCRE2_SPTR8)spkt->streamid, sidlen, 0, 0,
-                       reader->reject_data, GetMatchContext ()) >= 0)
+                       reader->reject_data, mctx) >= 0)
         skip = 1;
 
     if (!skip)

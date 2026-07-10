@@ -1003,15 +1003,34 @@ ListenThread (void *arg)
       lprintf (0, "Could not disable TCP delay algorithm: %s", strerror (errno));
     }
 
-    /* Tune socket send/receive buffers for high-throughput SeedLink streaming.
-     * 1 MiB send buffer: accommodates bursts of many 512-byte miniSEED records
-     * queued per client without blocking the client thread, even at 1000+ clients.
-     * 128 KiB receive buffer: SeedLink clients send very few bytes (commands only).
-     * These are hints; the kernel may clamp them to net.core.{w,r}mem_max.
-     * Recommended sysctl: net.core.wmem_max=4194304 net.core.rmem_max=524288 */
+    /* Disable delayed ACK to speed up SeedLink command-response exchanges.
+     * Without this, Linux waits ~40ms before sending ACK for received data,
+     * adding latency to every handshake and command round-trip.
+     * TCP_QUICKACK is not sticky on Linux (reverts after first ACK),
+     * but setting it after accept covers the critical initial exchange. */
+#ifdef TCP_QUICKACK
+    if (setsockopt (clientsocket, tcpprotonumber, TCP_QUICKACK, (void *)&one, sizeof (one)))
     {
-      int sndbuf = 1024 * 1024;
-      int rcvbuf = 128  * 1024;
+      lprintf (2, "Could not enable TCP_QUICKACK: %s", strerror (errno));
+    }
+#endif
+
+    /* Tune socket send/receive buffers for high-throughput SeedLink streaming.
+     *
+     * Send buffer sizing (SO_SNDBUF):
+     *   512 KiB — accommodates bursts of miniSEED records per client.
+     *   Sized for Raspberry Pi CM4 with 1 GB RAM:
+     *     200 clients × 512 KB = ~100 MB total send buffer memory.
+     *   For systems with 2+ GB RAM, increase to 1 MiB (1024*1024).
+     *
+     * Receive buffer (SO_RCVBUF):
+     *   64 KiB — SeedLink clients send very few bytes (commands only).
+     *
+     * These are hints; the kernel clamps to net.core.{w,r}mem_max.
+     * See doc/sysctl-tuning.conf for required sysctl settings. */
+    {
+      int sndbuf = 512 * 1024;
+      int rcvbuf =  64 * 1024;
       if (setsockopt (clientsocket, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof (sndbuf)))
         lprintf (2, "[%s] setsockopt(SO_SNDBUF): %s", ipstr, strerror (errno));
       if (setsockopt (clientsocket, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof (rcvbuf)))
