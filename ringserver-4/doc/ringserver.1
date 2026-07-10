@@ -1,0 +1,715 @@
+.TH RINGSERVER 1 2026/04/20
+.SH NAME
+ringserver \- stream oriented packet ring buffer
+
+.SH SYNOPSIS
+.nf
+ringserver [options] [configfile]
+.fi
+
+.SH DESCRIPTION
+\fBringserver\fP is a streaming data server with support for SeedLink,
+DataLink and HTTP protocols.
+
+The implementation is based on a ring buffer design that operates on
+a first-in-first-out basis with newly arriving packets pushing older
+packets out of the buffer. The packet payloads are not format specific
+and may contain any type of data.  All communications are performed
+via TCP interfaces.  Data streams are available to clients using the
+SeedLink and DataLink protocols and submitted to the server using the
+DataLink protocol.  WebSocket connections are supported for the
+SeedLink and DataLink protocols.  General server status is available
+via HTTP in JSON or formatted summaries.
+
+The server is configured either with options on the command line,
+through environment variables, and/or by using a \fBringserver\fP
+config file.  The order of precedence for configuration options is
+command line, environment variables, and then config file.
+
+Only the most common options are available on the command line, all
+options are controllable via environment variables and the config file.
+Detailed descriptions for each option are included in the example
+config file that accompanies the source code.  Many options are dynamic,
+meaning that they can be changed while the server is running when
+using a config file.  The server will recognize that the config file
+has changed and re-read its configuration.  This is especially useful
+for updating access controls, logging verbosity and other logging
+parameters without restarting the server.
+
+In normal operation packet buffer contents are saved in files when the
+server is shut down making the server stateful across restarts.  By
+default the packet buffer is managed as a memory-mapped file. The
+buffer can optionally be maintained completely in system memory, only
+reading and writing the buffer contents on startup and shutdown (useful
+in environments where memory-mapping is not possible).
+
+Client access is controlled using IP addresses.  Controls include
+match, reject, limit, write and trust permissions.
+See \fBAccess Control\fP for more details.
+
+Usage logs can optionally be written to track server activity.  Transfer
+logs (TX/RX) record the number of data packet bytes of each unique stream
+transferred to or from each client connection.  Access logs record
+connection events and key commands (connect, disconnect, INFO requests,
+data streaming starts, and HTTP requests) in JSON Lines format.
+
+The server supports streaming data with multiple protocols: SeedLink,
+DataLink, HTTP with WebSocket.  The server can listen on multiple
+network ports, and each port can be configured to support any combination
+of the protocols.
+See \fBMulti-protocol Support\fP for more information.
+
+The server also has limited support for simple HTTP requests.  When
+support is enabled, server status, stream lists and other details can
+be accessed with simple HTTP requests.
+See \fBHTTP Support\fP for more details.
+
+The dalitool(1) and slinktool(1) programs can be used to query the
+ringserver for various information via the DataLink and SeedLink
+interfaces respectively.  The dalitool program was developed in
+parallel with ringserver and the DataLink protocol and is the
+recommended query tool for ringserver admins.
+
+.SH OPTIONS
+
+.IP "-V"
+Print the program version and exit.
+
+.IP "-h"
+Print the program help/usage and exit.
+
+.IP "-H"
+Print an extended help/usage and exit.
+
+.IP "-C"
+Print a ringserver configuration file and exit.  The output contains
+descriptions of all available configuration parameters and the
+environment variables that can be used to set them.
+
+.IP "-v"
+Be more verbose.  This flag can be used multiple times ("-v -v" or
+"-vv") for more verbosity.
+
+.IP "-I \fIServerID\fP"
+Server ID reported to the clients.  The value may be a quoted string
+containing spaces.  The default value is "Ring Server".
+
+.IP "-M \fImaxclientsperIP\fP"
+Maximum number of concurrently connected clients per IP address.  This
+limit does not apply to addresses with write permission.  There is no
+default maximum.
+
+.IP "-m \fImaxclients\fP"
+Maximum number of concurrently connected clients.  The default maximum
+is 600.
+
+.IP "-Rd \fIringdir\fP"
+Base directory for the server to store the packet buffer data files.
+This parameter must be specified via this option, environment variable,
+or config file; there is no default.
+
+.IP "-Rs \fIbytes\fP"
+Size of the packet buffer in bytes, default size is 1 GiB.  The size of
+the ring, in combination with the ring packet size, determine how much
+past data is available in the buffer.  If the server is configured to
+memory-map the packet buffer files the maximum size of the ring is
+limited to how large a file the host system can support.  If the
+server is configured to maintain the ring in system memory the size is
+limited to system memory.
+
+.IP "-Rp \fIpacketsize\fP"
+Maximum ring packet data size (not including packet buffer header),
+default is 512 bytes.
+
+.IP "-NOMM"
+No memory-mapping, maintain the ring buffer in system memory only.  On
+startup the ring buffer files will be read into memory and on shutdown
+the memory buffers will be written back to the files.  This option
+might be useful in environments where memory-mapping of files is not
+possible or is unreliable or slow (e.g. network storage).
+
+.IP "-L \fIport\fP"
+Network port to listen for incoming connections on.  By default the
+server will not listen for connections, setting at least one listen
+port is needed to communicate with the server.  By default, a listening
+port will accept all supported protocols.  Restricting a port to only
+allow specific protocols can be done using a configuration file or adding
+flags to the port declaration, see \fBMulti-protocol Support\fP for more
+information.
+
+.IP "-SL \fIport\fP"
+.IP "-DL \fIport\fP"
+.IP "-HL \fIport\fP"
+These options are shortcuts for configuring a listening port for only
+SeedLink, DataLink or HTTP protocols respectively.
+
+.IP "-U \fIlogdir\fP"
+Usage log base directory.  By default the server does not write usage
+logs.  If a directory is specified, transmission (TX), reception (RX),
+and access logs are all written by default; these can be toggled
+individually with the \fBUsageLogTX\fP, \fBUsageLogRX\fP, and
+\fBUsageLogAccess\fP config file parameters.
+The \fB-T\fP flag is accepted as a backward-compatible alias.
+
+.IP "-Ui \fIhours\fP"
+Usage log writing interval in hours, default interval is 24 hours.
+The interval always starts at day boundaries, for example if the
+interval is set to 2 hours then the first interval in a given day will
+cover hours 0 through 2, the next 2 through 4, etc.
+The \fB-Ti\fP flag is accepted as a backward-compatible alias.
+
+.IP "-Up \fIprefix\fP"
+Usage log file prefix, by default no prefix is added to the fixed
+section of the log file name.
+The \fB-Tp\fP flag is accepted as a backward-compatible alias.
+
+.IP "-Uj"
+Enable JSON Lines format for transfer logs.  When enabled, each TX and
+RX log file uses a \fB.jsonl\fP extension and contains one JSON object
+per client session describing the protocol, streams, and byte counts.
+This replaces the legacy text format for transfer logs.
+The \fB-Tj\fP flag is accepted as a backward-compatible alias.
+
+.IP "-STDERR"
+Send all diagnostic output to stderr instead of stdout.  This is
+useful in situations where logging output is captured by another
+program on stderr and to separate ringserver diagnostics from other
+output on the console.
+
+.IP "-MSWRITE \fIformat\fP"
+A special mode of ringserver is to write all miniSEED data records
+received via DataLink to a user defined directory and file structure.
+See \fBminiSEED Archiving\fP for more details.
+
+.IP "-MSSCAN \fIdirectory\fP [suboptions]"
+A special mode of ringserver is to recursively scan a directory for
+files containing miniSEED formatted data records and insert them into
+the buffer.  Optional suboptions control scanning behavior, the
+StateFile suboption is highly recommended.
+See \fBminiSEED Scanning\fP for more details.
+
+.IP "-VOLATILE"
+Create a volatile (non-stateful) ring buffer. Do not read or write
+packet buffer contents from ring files.  This is useful in combination
+with the -MSWRITE option when no stateful buffer is needed or scenarios
+where the buffer is not needed after a restart.
+
+.SH "Config file parameters"
+All of the command line parameters have config file and environment
+variable equivalents.  Many of the config file parameters are dynamic,
+if they are changed the server will re-read its configuration on the
+fly. See the detailed parameter descriptions in the documented example
+config file.
+
+.SH "Access Control"
+
+Access control is based on IP addresses and user authentication.
+Authentication is optional and can be used in combination with IP
+address based access control.  Authentication can be required for
+clients requesting streaming data using the
+\fBAuthRequiredForStreams\fP config parameter, or
+\fBS_AUTH_REQUIRED_FOR_STREAMS\fP environment variable.
+
+The IP-based access control is specified in the config file using
+the following parameters:
+
+.nf
+  \fBAcceptIP\fP or \fBRS_ACCEPT_IP\fP
+  \fBDenyIP\fP or \fBRS_DENY_IP\fP
+  \fBAllowedStreamsIP\fP or \fBRS_ALLOWED_STREAMS_IP\fP
+  \fBForbiddenStreamsIP\fP or \fBRS_FORBIDDEN_STREAMS_IP\fP
+  \fBWriteIP\fP or \fBRS_WRITE_IP\fP
+  \fBTrustedIP\fP or \fBRS_TRUSTED_IP\fP
+.fi
+
+By default all clients are allowed to connect.  Specific clients can
+be rejected using the \fBDenyIP\fP config parameter.  If any
+\fBAcceptIP\fP config parameters are specified only addresses that
+match one of the entries, and are not rejected, are allowed to connect.
+
+By default all clients are allowed access to all streams in the
+buffer, and clients with write permission are allowed to write any
+streams.  Specific clients can be limited to access or write subsets
+of streams using the \fBAllowedStreamsIP\fP config parameter.  Specific
+clients can be forbidden from accessing subsets streams using the
+\fBForbiddenStreamsIP\fP config parameter. These parameters
+accept a regular expression that is used to match stream IDs that the
+client(s) are allowed or forbidden.
+
+By default all clients are allowed to request the server ID, simple
+status and list of streams.  Specific clients can be allowed to access
+connection information and more detailed status using the
+\fBTrustedIP\fP access control.
+
+If no client addresses are granted write permission via \fBWriteIP\fP
+or granted trusted status via \fBTrustedIP\fP then the 'localhost'
+address (local loopback) are granted those permissions.
+
+Access control is host range (network) based, and specified as an
+address followed by an optional prefix in CIDR notation.  For example:
+"192.168.0.1/24" specifies the range of addresses from 192.168.0.1 to
+192.168.0.254.  The address may be a hostname, which will be resolved
+on startup.  The prefix is optional and, if omitted, defaults to
+specifying only the single address.
+
+The authentication-based access control is specified in the config file
+using the following parameters:
+.nf
+  \fBAuthCommand\fP or \fBRS_AUTH_COMMAND\fP
+  \fBAuthTimeout\fP or \fBRS_AUTH_TIMEOUT\fP
+.fi
+
+The \fBAuthCommand\fP config parameter specifies a command to be executed
+when a client connects to the server and requests authentication.  The
+command is executed with the USERNAME and PASSWORD environment variables
+set to the values provided by the client.  The command should return a JSON
+formatted object on stdout with the following optional keys:
+.nf
+{
+  "authenticated": <boolean>,
+  "write_permission": <boolean>,
+  "trust_permission": <boolean>,
+  "allowed_streams": ["streamregex1", "streamregex2"],
+  "forbidden_streams": ["streamregex3", "streamregex4"]
+}
+.fi
+
+The \fBauthenticated\fP key must be present and set to true for the client
+to be allowed to connect.  Missing keys are treated as false or empty.
+
+.SH "SeedLink Support"
+
+The legacy SeedLink protocol (v3) only transmits 512-byte miniSEED data
+records.  This server is able to transmit miniSEED records of any
+length via SeedLink.  If you wish to ensure compatibility with
+legacy clients, only 512-byte miniSEED records should be submitted
+to the server.
+
+This server supports the wild-carding of network and station codes
+during SeedLink negotiation using the '?' and '*' characters for
+single or multiple character matches respectively.  Not all SeedLink
+clients support wild-carded network and station codes.
+
+SeedLink v4 clients can additionally use filters to selected streams
+with labels.  See \fBOptional stream ID labels\fP for more details.
+
+.SH "Stream IDs"
+
+Each unique data stream is identified by a stream ID.  The stream ID
+can be arbitrary but is commonly a combination of a data source
+identifier and a suffix (separated by a slash) that identifies the
+the payload type.  For example:
+
+"FDSN:IU_COLA_00_B_H_Z/MSEED"
+
+For the SeedLink protocol support, data source IDs must be valid FDSN
+Source IDs (https://docs.fdsn.org/projects/source-identifiers) with
+a format suffix of "/MSEED" or "/MSEED3".
+
+The stream ID suffix recommendations are as follows:
+
+.nf
+  \fBMSEED\fP   : miniSEED v2 data records
+  \fBMSEED3\fP  : miniSEED v3 data records
+  \fBJSON\fP    : JSON payloads
+  \fBTEXT\fP    : Text payloads, where UTF-8 is assumed
+.fi
+
+The maximum length of stream IDs supported by the server is 63 bytes.
+
+.SS "Optional stream ID labels"
+
+A stream ID may carry an optional label suffix, producing IDs of the form:
+
+"FDSN:IU_COLA_00_B_H_Z/MSEED3/1SEC"
+
+Labels are used to partition streams that would otherwise share the same
+FDSN Source ID (for example, multiple variants of the same channel produced
+by different processing paths).  Labels may be up to 11 characters long and
+may contain letters, digits, underscore '_' and hyphen '-'.  The tokens
+\fBnative\fP and \fB3\fP are reserved SeedLink v4 filter keywords and
+cannot be used as label values.
+
+Labeled streams are \fBnot\fP served to SeedLink clients by default: a
+client must explicitly request them using the SeedLink v4 SELECT syntax
+with a \fB:LABEL\fP suffix, for example:
+
+.nf
+  \fBSELECT *_B_H_?:1SEC\fP
+.fi
+
+The '?' and '*' glob wildcards are accepted in the label portion.  A
+SELECT without a \fB:LABEL\fP suffix matches only unlabeled streams for
+the given pattern.
+
+The sole exception is "all-station" mode: a SeedLink client that starts
+data flow without issuing any STATION or SELECT commands receives every
+packet in the ring, including labeled streams, because no stream filter
+is applied.
+
+DataLink clients match stream IDs directly with client-supplied regular
+expressions, so labels are part of the stream ID text and are included
+or excluded by whatever regex the client supplies.
+
+.SH "Multi-protocol Support"
+
+Network listening ports can respond to all supported protocols:
+SeedLink, DataLink and HTTP/WebSocket.  If more than one protocol
+is configured for a port, the first command received by the server
+is used to determine which protocol is being used by the client,
+all subsequent communication is expected in this protocol.
+
+Both IPv4 and IPv6 protocol families are supported by default (if
+supported by the system).
+
+The network protocols and families allowed by any given listening
+port can be set by adding flags to the port specification.  See the
+available flags in the \fBListenPort\fP description of the reference
+config file printed using the \fB-C\fP command line option.
+
+The \fBPROXYv2\fP flag enables support for the HAProxy PROXY protocol
+version 2. When this flag is set, the server will expect every client
+connection on that port to send a valid PROXY protocol v2 header before
+any actual protocol data. This allows the server to determine the true
+source address and port of the connecting client, as often required
+when the traffic flows through a trusted proxy or load balancer.
+\fBImportant:\fP The PROXY protocol should only be enabled on ports that
+are exclusively reachable by trusted proxies since the client may specify
+any IP address in the PROXY header, potentially spoofing their source
+address. Do not use the PROXYv2 flag on publicly accessible ports.
+
+The \fBTRUSTED\fP flag grants trusted status to all clients connecting
+on a port, allowing access to detailed server status and connection
+information.  \fBWARNING:\fP Do not use this flag on publicly accessible
+ports as it grants elevated access to all connecting clients regardless
+of their IP address.
+
+Examples of adding flags to a port specification:
+
+.nf
+  \fB-L "18000 SeedLink HTTP"\fP        : CLI, SeedLink and HTTP on port 18000
+  \fB-SL "18500 TLS IPv4"\fP            : CLI, SeedLink via TLS on port 18500, IPv4 only
+  \fBRS_LISTEN_PORT="8080 HTTP IPv6"\fP : EnvVar, HTTP on port 8080, IPv6 only
+  \fBListenPort 16000 DataLink\fP       : Config file, DataLink on port 16000
+  \fBListenPort 14000 TRUSTED\fP        : Config file, all protocols trusted on port 14000
+  \fBListenPort 18000 PROXYv2\fP      : Config file, all protocols with PROXYv2 on port 18000
+.fi
+
+.SH "HTTP Support"
+
+The server will respond to HTTP requests for a few fixed resources.
+If the \fBWebRoot\fP config parameter is set to a directory, the files
+under that directory will also be served when requested through the
+HTTP GET method.  Except for the fixed resources, the HTTP server
+implementation is limited to returning existing files and returning
+"index.html" files when a directory is requested.
+
+The following fixed resources are supported:
+
+.nf
+  \fB/id\fP           - Server identification
+  \fB/id/json\fP      - Server identification in JSON
+  \fB/streams\fP      - List of available streams with time range
+  \fB/streams/json\fP - List of available streams with time range in JSON
+  \fB/streamids\fP    - List of available streams
+  \fB/status\fP       - Server status, limited access*
+  \fB/status/json\fP  - Server status in JSON, limited access*
+  \fB/connections\fP  - List of connections, limited access*
+  \fB/connections/json\fP - List of connections in JSON, limited access*
+  \fB/seedlink\fP     - Initiate WebSocket connection for Seedlink
+  \fB/datalink\fP     - Initiate WebSocket connection for DataLink
+.fi
+
+Access to the \fBstatus\fP and \fBconnections\fP information is
+limited to clients that have trusted permission.
+
+The \fBstreams\fP, \fBstreamids\fP and \fBconnections\fP endpoints
+accept a \fImatch\fP parameter that is a regular expression pattern
+used to limit the returned information.  For the \fBstreams\fP and
+\fBstreamids\fP endpoints the matching is applied to stream IDs.  For
+the \fBconnections\fP endpoint the matching is applied to hostname,
+client IP address and client ID. For example:
+http://localhost/streams?match=IU_ANMO.
+
+After a WebSocket connection has been initiated with either the
+\fBseedlink\fP or \fBdatalink\fP end points, the requested protocol is
+supported exactly as it would be normally with the addition of
+WebSocket framing.  Each server command, including terminator(s),
+should be contained in a WebSocket frame.
+
+Custom HTTP headers may be included in HTTP responses using the
+\fBHTTPHeader\fP config file parameter.  This can be used, for example,
+to enable cross-site HTTP requests via Cross-Origin Resource Sharing (CORS).
+
+.SH "Usage logging"
+
+Usage logging covers two distinct log types: transfer logs (TX/RX) that
+track data volume per stream per client, and access logs that record
+connection events and key commands.  All log types share the same base
+directory, file prefix, and rotation interval, configured via the
+\fB-U\fP command line option or the \fBUsageLogDirectory\fP config file
+parameter (the \fBTransferLogDirectory\fP alias is also accepted for
+backward compatibility).  All three log types (TX, RX, and access) are
+enabled by default when a usage log directory is specified.
+
+.SS "Transfer logging"
+
+The \fBUsageLogTX\fP and \fBUsageLogRX\fP config file parameters (or their
+\fBTransferLogTX\fP / \fBTransferLogRX\fP aliases, or equivalent environment
+variables) control logging of data transmitted or received.  By default
+both TX and RX logging are enabled when a log directory is set.  The log
+interval and file name prefix can be changed via the \fB-Ui\fP and \fB-Up\fP
+command line options.
+
+Log files are named with the interval time window, for example:
+.nf
+  \fBtxlog-20260316T0000-20260317T0000\fP
+  \fBrxlog-20260316T0000-20260317T0000\fP
+.fi
+
+Entries are only written for clients that transmitted or received data;
+clients with no activity in a given direction are omitted from the
+respective log file.
+
+By default transfer logs use a legacy text format.  The \fB-Uj\fP command
+line option or the \fBUsageLogJSONLines\fP config parameter enables JSON
+Lines format instead, where each line is a JSON object containing
+protocol details, per-stream byte counts, and client metadata.
+
+In text format, each TX or RX log file contains entries with this pattern:
+
+1) A "START CLIENT" line containing the host name, IP address,
+protocol, client ID, log time, and connection time.
+
+2) One or more data lines of the following form:
+
+.nf
+\fB[Stream ID] [bytes] [packets]\fP
+.fi
+
+3) An "END CLIENT" line including the total bytes for this entry.
+
+Note: the byte counts are the sum of the data payload bytes in each
+packet and do not include the DataLink or SeedLink protocol headers.
+
+An example "TX" file illustrating a transmission entry in legacy text format:
+
+.nf
+START CLIENT host.iris.edu [192.168.255.255] (SeedLink|slinktool/4.11) @ 2018-03-30 07:00:05 (connected 2018-03-30 06:59:36) TX
+FDSN:IU_SNZO_10_B_H_Z/MSEED 2560 5
+FDSN:IU_SNZO_00_B_H_Z/MSEED 2048 4
+END CLIENT host.iris.edu [192.168.255.255] total TX bytes: 4608
+.fi
+
+.SS "Access logging"
+
+Access logging is enabled by default when \fBUsageLogDirectory\fP
+(or the \fB-U\fP option) is set.  It can be disabled with
+\fBUsageLogAccess 0\fP in the config file or the \fBRS_USAGE_LOG_ACCESS\fP
+environment variable.
+
+Access log files are always written in JSON Lines format, one JSON object
+per line, with a \fB.jsonl\fP extension.  Files are named:
+.nf
+  \fBaccesslog-20260316T0000-20260317T0000.jsonl\fP
+.fi
+
+Each access log record contains the event time, client metadata
+(IP address, hostname, server port, user agent), authentication details
+if applicable, protocol information (name, version, TLS, WebSocket), and
+the event or command details.
+
+The following events are logged:
+
+.nf
+  \fBconnect\fP    - Client TCP connection established
+  \fBdisconnect\fP - Client connection closed
+  \fBcommand\fP    - Key protocol command received
+.fi
+
+Key commands recorded include:
+
+.nf
+  \fBINFO\fP         - SeedLink or DataLink INFO request (with item/type)
+  \fBDATA\fP/\fBFETCH\fP  - SeedLink data streaming request (with stream selection criteria)
+  \fBSTREAM\fP       - DataLink streaming start (with stream selection criteria)
+  \fBGET\fP          - HTTP GET request (with path)
+.fi
+
+For DATA/FETCH and STREAM commands, the \fBmatch\fP and \fBreject\fP fields
+in the JSON record contain the regular expressions used to select streams,
+if any were specified by the client.
+
+An example access log record:
+
+.nf
+{"log_time":"2026-03-16T12:00:00Z","connect_time":"2026-03-16T11:59:55Z",
+ "client":{"ip":"192.168.1.10","server_port":18000,"hostname":"host.example.com",
+           "user_agent":"slinktool/4.1"},
+ "protocol":{"name":"SeedLink","version":"4.0"},
+ "event":"command","command":"DATA","match":"FDSN:IU_.*",
+ "service":{"name":"ringserver","version":"4.3.1"}}
+.fi
+
+.SH "External packet IDs"
+
+With the DataLink v1.1 protocol a client may submit packets with a
+specified packet ID to use instead of a generated ID.  This is useful
+to implement multiple servers that share common packet IDs for use
+with a network load balancer, such that it does not matter to which
+server a client connects.
+
+These packet IDs are used in the SeedLink and DataLink protocols by
+clients to track and resume data streams.  In SeedLink these are called
+sequence numbers.
+
+For ringserver, packet IDs, aka sequence numbers, must be between 0 and
+(UINT64_MAX - 10), or 18446744073709551605.  The last 10 values
+of the uint64 range are reserved for internal use to indicate special
+conditions.  These values are not expected to be encountered in typical
+data streaming operation.
+
+Furthermore, external IDs submitted with packets are strongly recommended
+to be unique and monotonically increasing.  Such a sequence of IDs
+support efficient data stream resumption and tracking.
+
+.SH "miniSEED Archiving"
+Using either the \fB-MSWRITE\fP command line option or the
+\fBMSeedWrite\fP config file parameter the server can be configured to
+write all miniSEED data records received via DataLink to a user
+defined directory and file structure.
+
+The archive \fIformat\fP argument is expanded for each packet processed
+using the following flags:
+
+.nf
+  \fBn\fP : network code, white space removed
+  \fBs\fP : station code, white space removed
+  \fBl\fP : location code, white space removed
+  \fBc\fP : channel code, white space removed
+  \fBq\fP : record quality indicator (D,R,Q,M), single character
+  \fBY\fP : year, 4 digits
+  \fBy\fP : year, 2 digits zero padded
+  \fBj\fP : day of year, 3 digits zero padded
+  \fBH\fP : hour, 2 digits zero padded
+  \fBM\fP : minute, 2 digits zero padded
+  \fBS\fP : second, 2 digits zero padded
+  \fBF\fP : fractional seconds, 4 digits zero padded
+  \fBD\fP : current year-day time stamp of the form YYYYDDD
+  \fBL\fP : data record length in bytes
+  \fBr\fP : sample rate (Hz) as a rounded integer
+  \fBR\fP : sample rate (Hz) as a float with 6 digit precision
+  \fBh\fP : host name of client submitting data
+  \fB%\fP : the percent (%) character
+  \fB#\fP : the number (#) character
+.fi
+
+The flags are prefaced with either the \fB%\fP or \fB#\fP modifier.
+The \fB%\fP modifier indicates a defining flag while the \fB#\fP
+indicates a non-defining flag.  All received packets with the same set
+of defining flags will be saved to the same file. Non-defining flags
+will be expanded using the values in the first packet received for the
+resulting file name.
+
+Time flags are based on the start time of the given packet.
+
+Files are created with (permission) mode 666 and directories are
+created with mode 777.  An operator of ringserver can control the
+final permissions of the files by adjusting the umask as desired.
+
+Some preset archive layouts are available:
+
+.nf
+  \fBBUD\fP   : \fI%n/%s/%s.%n.%l.%c.%Y.%j\fP  (BUD layout)
+  \fBCHAN\fP  : \fI%n.%s.%l.%c\fP  (channel)
+  \fBQCHAN\fP : \fI%n.%s.%l.%c.%q\fP  (quality-channel-day)
+  \fBCDAY\fP  : \fI%n.%s.%l.%c.%Y:%j:#H:#M:#S\fP  (channel-day)
+  \fBSDAY\fP  : \fI%n.%s.%Y:%j\fP  (station-day)
+  \fBHSDAY\fP : \fI%h/%n.%s.%Y:%j\fP  (host-station-day)
+.fi
+
+The preset archive layouts are used by prefixing a target directory
+with the preset identifier followed by an '@' character.  For example:
+
+\fBBUD@/data/bud/\fP
+
+would write a BUD like structure in the /data/bud/ directory.
+
+Other example:
+
+\fB/archive/%n/%s/%n.%s.%l.%c.%Y.%j\fP
+
+would be expanded to day length files named something like:
+
+\fB/archive/IU/ANMO/IU.ANMO..BHE.2003.055\fP
+
+Using non-defining flags the format string:
+
+\fB/data/%n.%s.%Y.%j.%H:#M:#S.miniseed\fP
+
+would be expanded to:
+
+\fB/data/IU.ANMO.2003.044.14:17:54.miniseed\fP
+
+resulting in hour length files because the minute and second are
+specified with the non-defining modifier.  The minute and second
+fields are from the first packet in the file.
+
+.SH "miniSEED Scanning"
+Using either the \fB-MSSCAN\fP command line option or the
+\fBMSeedScan\fP config file parameter (or equivalent environment
+variable) the server can be configured to recursively scan a directory
+for files containing miniSEED data records and insert them into the
+buffer.  Intended for real-time data re-distribution, files are
+continuously scanned, newly added records are inserted into the buffer.
+
+Sub-options can be used to control the scanning process.  The
+sub-options are specified on the same line as the scan directory as
+key-value pairs separated by an equals '=' character and may not
+contain spaces (because they are separated by spaces).  Do not use
+quotes for the values.  The available sub-options are:
+
+.nf
+  \fBStateFile\fP : File to save scanning state through restarts
+  \fBMatch\fP : Regular expression to match file names
+  \fBReject\fP : Regular expression to reject file names
+  \fBInitCurrentState\fP : Initialize scanning to current state
+  \fBMaxRecurse\fP : Maximum recursion depth (default is no limit)
+.fi
+
+Except for special cases the \fBStateFile\fP option should always be
+specified, otherwise a restart of the server could re-read data
+records that it has already read.
+
+If the \fBInitCurrentState\fP option is set to '\fBy\fP' the scanning
+will only read new data, effectively skipping all the data discovered
+during the first scan, under the following conditions:
+.nf
+1) No StateFile has been specified
+2) StateFile has been specified but does not exist
+.fi
+
+The \fBInitCurrentState\fP option is useful to avoid reading all
+existing data when starting a server scanning an existing large
+dataset.  It is also useful to reset the dataflow to current data
+after a lengthy downtime, simply remove the statefile(s) before
+starting the server.
+
+To scan a data directory and save the scanning state to a StateFile
+configure the server with either a config file option or command line,
+respectively:
+
+\fBMSeedScan /data/miniseed/ StateFile=/opt/ringserver/scan.state\fP
+
+\fB-MSScan "/data/miniseed/ StateFile=/opt/ringserver/scan.state"\fP
+
+To limit the scanning to file names matching a certain pattern use
+the Match option, e.g. files ending in ".mseed":
+
+\fBMSeedScan /data/miniseed/ StateFile=/data/scan.state Match=.*\\.mseed$\fP
+
+.SH AUTHOR
+.nf
+Chad Trabant
+EarthScope Data Services
+.fi

@@ -1,0 +1,11 @@
+/bin/
+/target/
+/Swarm.config
+/Swarm.config.bak
+/PickSettings.config
+/DataSources.config
+/log4j.properties
+.checkstyle
+.DS_Store
+*.log
+logback.*

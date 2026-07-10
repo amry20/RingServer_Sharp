@@ -1,0 +1,62 @@
+/**************************************************************************
+ * dlclient.h
+ *
+ * This file is part of the ringserver.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Copyright (C) 2026:
+ * @author Chad Trabant, EarthScope Data Services
+ **************************************************************************/
+
+#ifndef DLCLIENT_H
+#define DLCLIENT_H 1
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <pthread.h>
+#include "rbtree.h"
+#include "ringserver.h"
+
+/* DataLink protocol version */
+#define DLPROTO_MAJOR 1
+#define DLPROTO_MINOR 1
+
+/* DataLink server capability flags */
+#define DLSERVERVER "RingServer/" VERSION
+#define DLMKSTR(x) DLMKSTR_(x)
+#define DLMKSTR_(x) #x
+#define DLSERVERPROTOCOLS "DLPROTO:" DLMKSTR(DLPROTO_MAJOR) "." DLMKSTR(DLPROTO_MINOR)
+#define DLCAPABILITIES_ID DLSERVERPROTOCOLS
+#define DLSERVER_ID "DataLink v" DLMKSTR(DLPROTO_MAJOR) "." DLMKSTR(DLPROTO_MINOR) " (" DLSERVERVER ") :: " DLCAPABILITIES_ID
+
+#define DLMAXREGEXLEN  1048576  /* Maximum regex pattern size */
+
+/* Structure to hold DataLink specific parameters */
+typedef struct DLInfo
+{
+  pcre2_code *legacy_mseed_streamid_match;      /* Compiled match expression */
+  pcre2_match_data *legacy_mseed_streamid_data; /* Match data results */
+} DLInfo;
+
+extern int DLHandleCmd (ClientInfo *cinfo);
+extern int DLStreamPackets (ClientInfo *cinfo);
+extern void DLFree (ClientInfo *cinfo);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* DLCLIENT_H */

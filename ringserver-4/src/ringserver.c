@@ -1,0 +1,1913 @@
+/**************************************************************************
+ * ringserver.c
+ *
+ * A streaming data server with support for SeedLink, DataLink and HTTP
+ * protocols.
+ *
+ * This file is part of the ringserver.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Copyright (C) 2026:
+ * @author Chad Trabant, EarthScope Data Services
+ **************************************************************************/
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/tcp.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <libmseed.h>
+
+#include "clients.h"
+#include "config.h"
+#include "dlclient.h"
+#include "dsarchive.h"
+#include "generic.h"
+#include "loadbuffer.h"
+#include "logging.h"
+#include "mseedscan.h"
+#include "proxyproto.h"
+#include "ring.h"
+#include "ringserver.h"
+#include "slclient.h"
+
+/* Reserve connection count, allows connections from addresses with write
+ * permission even when the maximum connection count has been reached. */
+#define RESERVECONNECTIONS 10
+
+#define GIBIBYTE (1024ULL * 1024ULL * 1024ULL)
+
+/* Fallback timeout (in milliseconds) for reading a PROXY protocol v2 header
+ * when the network I/O timeout is disabled (netiotimeout == 0). */
+#define PROXY_HEADER_TIMEOUT_MAX_MS 100000
+
+/* Global parameter declaration and defaults */
+struct param_s param = {
+    .ringlock       = PTHREAD_MUTEX_INITIALIZER,
+    .ringbuffer     = NULL,
+    .datastart      = NULL,
+    .version        = RING_VERSION,
+    .ringsize       = 0,
+    .pktsize        = 0,
+    .maxpackets     = 0,
+    .maxoffset      = 0,
+    .headersize     = 0,
+    .earliestoffset = -1,
+    .latestoffset   = -1,
+
+    .streamlock  = PTHREAD_MUTEX_INITIALIZER,
+    .streamidx   = NULL,
+    .streamcount = 0,
+
+    .clientcount     = 0,
+    .shutdownsig     = 0,
+    .serverstarttime = NSTUNSET,
+    .configfilemtime = 0,
+    .sthreads_lock   = PTHREAD_MUTEX_INITIALIZER,
+    .sthreads        = NULL,
+    .cthreads_lock   = PTHREAD_MUTEX_INITIALIZER,
+    .cthreads        = NULL,
+    .txpacketrate    = 0.0,
+    .txbyterate      = 0.0,
+    .rxpacketrate    = 0.0,
+    .rxbyterate      = 0.0,
+};
+
+/* Configuration parameter declaration and defaults */
+struct config_s config = {
+    .config_rwlock         = PTHREAD_RWLOCK_INITIALIZER,
+    .verbose               = 0,
+    .configfile            = NULL,
+    .serverid              = NULL,
+    .ringdir               = NULL,
+    .ringsize              = GIBIBYTE,
+    .pktsize               = sizeof (RingPacket) + 512,
+    .maxclients            = 600,
+    .maxclientsperip       = 0,
+    .clienttimeout         = 3600,
+    .netiotimeout          = 10,
+    .tcpkeepalive_idle     = 60,
+    .tcpkeepalive_interval = 30,
+    .tcpkeepalive_count    = 4,
+    .timewinlimit          = 1.0,
+    .resolvehosts          = 1,
+    .memorymapring         = 1,
+    .volatilering          = 0,
+    .autorecovery          = 1,
+    .webroot               = NULL,
+    .httpheaders           = NULL,
+    .mseedarchive          = NULL,
+    .mseedidleto           = 300,
+    .allowedips            = NULL,
+    .forbiddenips          = NULL,
+    .acceptips             = NULL,
+    .denyips               = NULL,
+    .writeips              = NULL,
+    .trustedips            = NULL,
+    .tlscertfile           = NULL,
+    .tlskeyfile            = NULL,
+    .tlsverifyclientcert   = 0,
+    .auth.program          = NULL,
+    .auth.argv             = NULL,
+    .auth.required         = 0,
+    .auth.timeout_sec      = 5,
+    .usagelog.write_lock   = PTHREAD_MUTEX_INITIALIZER,
+    .usagelog.mode         = USAGELOG_NONE,
+    .usagelog.basedir      = NULL,
+    .usagelog.prefix       = NULL,
+    .usagelog.interval     = 86400,
+    .usagelog.startint     = 0,
+    .usagelog.endint       = 0,
+};
+
+/* Local functions and variables */
+static void LogServerParameters (void);
+static struct thread_data *InitThreadData (void *prvtptr);
+static void *ListenThread (void *arg);
+static ClientInfo *ConfigClient (struct sockaddr *paddr, int clientsocket,
+                                 const ListenPortParams *lpp,
+                                 const char *ipstr, const char *portstr);
+static int CalcStats (ClientInfo *cinfo);
+static IPNet *MatchIP (IPNet *list, struct sockaddr *addr);
+static int ClientIPCount (struct sockaddr *addr);
+static void *SignalThread (void *arg);
+static void PrintHandler (void);
+
+static sigset_t globalsigset;
+static int tcpprotonumber = -1;
+
+int
+main (int argc, char *argv[])
+{
+  char ringfilename[PATH_MAX]      = {0};
+  char streamfilename[PATH_MAX]    = {0};
+  char ringfile_backup[PATH_MAX]   = {0};
+  char streamfile_backup[PATH_MAX] = {0};
+  nstime_t hpcurtime;
+  time_t curtime;
+  time_t chktime;
+  struct timespec timereq;
+  pthread_t stid;
+  pthread_t sigtid;
+  struct sthread *stp;
+  struct sthread *loopstp;
+  struct cthread *ctp;
+  struct cthread *loopctp;
+  int usage_interval_ended = 0;
+  int server_thread_count  = 0;
+
+  double txpacketrate;
+  double txbyterate;
+  double rxpacketrate;
+  double rxbyterate;
+
+  struct stat cfstat;
+  int ringinit;
+
+  uint16_t convert_version = 0;
+
+  struct protoent *pe_tcp;
+
+  /* Ring descriptor */
+  int ringfd = -1;
+
+  /* Process command line parameters */
+  if (ProcessParam (argc, argv) < 0)
+    return 1;
+
+  /* Redirect libmseed logging facility to lprintf() via the lprint() shim */
+  ms_loginit (lprint, NULL, lprint, NULL);
+
+  /* Signal handling using POSIX routines, create set of all signals */
+  if (sigfillset (&globalsigset))
+  {
+    lprintf (0, "Error: sigfillset() failed, cannot initialize signal set");
+    return 1;
+  }
+
+  /* Block signals in set, mask is inherited by all child threads */
+  if (pthread_sigmask (SIG_BLOCK, &globalsigset, NULL))
+  {
+    lprintf (0, "Error: pthread_sigmask() failed, cannot set thread signal mask");
+    return 1;
+  }
+
+  /* Start signal handling thread */
+  lprintf (2, "Starting signal handling thread");
+
+  if ((errno = pthread_create (&sigtid, NULL, SignalThread, NULL)))
+  {
+    lprintf (0, "Error creating signal handling thread: %s", strerror (errno));
+    return 1;
+  }
+
+  /* Look up & store the system TCP protocol entry */
+  if (!(pe_tcp = getprotobyname ("tcp")))
+  {
+    lprintf (0, "Error: cannot determine the system protocol number for TCP");
+    return 1;
+  }
+  else
+  {
+    tcpprotonumber = pe_tcp->p_proto;
+  }
+
+  /* Initialise the shared PCRE2 match context early */
+  (void)GetMatchContext ();
+
+  /* Init ring parameters */
+  if (config.ringdir || config.volatilering)
+  {
+    if (!config.volatilering)
+    {
+      /* Create ring file path: "<ringdir>/packetbuf" */
+      if (snprintf (ringfilename, sizeof (ringfilename), "%s/packetbuf", config.ringdir) >= sizeof (ringfilename))
+      {
+        lprintf (0, "Error: ring buffer directory too long");
+        return 1;
+      }
+
+      /* Create stream index file path: "<ringdir>/streamidx" */
+      if (snprintf (streamfilename, sizeof (streamfilename), "%s/streamidx", config.ringdir) >= sizeof (streamfilename))
+      {
+        lprintf (0, "Error: ring buffer directory too long");
+        return 1;
+      }
+    }
+
+    /* Initialize ring system */
+    if ((ringinit = RingInitialize (ringfilename, streamfilename, &ringfd)))
+    {
+      /* Exit on unrecoverable errors or if no auto recovery */
+      if (ringinit == -2 || !config.autorecovery)
+      {
+        lprintf (0, "Error initializing ring buffer (%d)", ringinit);
+        return 1;
+      }
+
+      if (ringfd >= 0)
+      {
+        if (close (ringfd))
+        {
+          lprintf (0, "Error closing ring buffer file: %s", strerror (errno));
+        }
+      }
+
+      /* Move corrupt packet buffer and index to backup (.corrupt) files */
+      if (config.autorecovery == 1 && (ringinit == -1 || ringinit > 0))
+      {
+        if (ringinit == -1)
+        {
+          lprintf (0, "Auto recovery, moving packet buffer and stream index files to .corrupt");
+
+          snprintf (ringfile_backup, sizeof (ringfile_backup), "%.*s.corrupt", (int)sizeof (ringfile_backup) - 10, ringfilename);
+          snprintf (streamfile_backup, sizeof (streamfile_backup), "%.*s.corrupt", (int)sizeof (streamfile_backup) - 10, streamfilename);
+        }
+        else
+        {
+          lprintf (0, "Auto recovery, moving packet buffer and stream index files to .version%d", ringinit);
+
+          snprintf (ringfile_backup, sizeof (ringfile_backup), "%.*s.version%d", (int)sizeof (ringfile_backup) - 24, ringfilename, ringinit);
+          snprintf (streamfile_backup, sizeof (streamfile_backup), "%.*s.version%d", (int)sizeof (streamfile_backup) - 24, streamfilename, ringinit);
+          convert_version = ringinit;
+        }
+
+        /* Rename original ring and stream files to the backup names */
+        if (rename (ringfilename, ringfile_backup) && errno != ENOENT)
+        {
+          lprintf (0, "Error renaming %s to %s: %s", ringfilename, ringfile_backup,
+                   strerror (errno));
+          return 1;
+        }
+        if (rename (streamfilename, streamfile_backup) && errno != ENOENT)
+        {
+          lprintf (0, "Error renaming %s to %s: %s", streamfilename, streamfile_backup,
+                   strerror (errno));
+          return 1;
+        }
+      }
+      /* Removing existing packet buffer and index */
+      else if (config.autorecovery == 2)
+      {
+        lprintf (0, "Auto recovery, removing existing packet buffer and stream index files");
+
+        /* Delete existing ring and stream files */
+        if (unlink (ringfilename) && errno != ENOENT)
+        {
+          lprintf (0, "Error removing %s: %s", ringfilename, strerror (errno));
+          return 1;
+        }
+        if (unlink (streamfilename) && errno != ENOENT)
+        {
+          lprintf (0, "Error removing %s: %s", streamfilename, strerror (errno));
+          return 1;
+        }
+      }
+      else
+      {
+        lprintf (0, "Unrecognized combination of auto recovery: %u, and ringinit return %d",
+                 config.autorecovery, ringinit);
+        return 1;
+      }
+
+      /* Re-initialize ring system */
+      if ((ringinit = RingInitialize (ringfilename, streamfilename, &ringfd)))
+      {
+        lprintf (0, "Error re-initializing ring buffer on auto-recovery (%d)", ringinit);
+        return 1;
+      }
+
+      if (config.autorecovery == 1 && convert_version > 0)
+      {
+        int64_t loaded_packets = 0;
+
+        if (convert_version == 1)
+        {
+          loaded_packets = LoadBufferV1 (ringfile_backup);
+        }
+        else if (convert_version == 2)
+        {
+          loaded_packets = LoadBufferV2 (ringfile_backup);
+        }
+        else if (convert_version == RING_VERSION)
+        {
+          loaded_packets = LoadBufferV3 (ringfile_backup);
+        }
+        else
+        {
+          lprintf (0, "Error: Cannot convert existing buffer version %d", convert_version);
+          return 1;
+        }
+
+        if (loaded_packets >= 0)
+        {
+          lprintf (0, "Loaded %" PRId64 " packets, removing backup files", loaded_packets);
+
+          /* Remove the backup files that have been converted */
+          if (unlink (ringfile_backup) && errno != ENOENT)
+          {
+            lprintf (0, "Error removing %s: %s", ringfile_backup, strerror (errno));
+            return 1;
+          }
+          if (unlink (streamfile_backup) && errno != ENOENT)
+          {
+            lprintf (0, "Error removing %s: %s", streamfile_backup, strerror (errno));
+            return 1;
+          }
+        }
+        else
+        {
+          lprintf (0, "Error loading packets from backup file: %s", ringfile_backup);
+        }
+      }
+    }
+  }
+  else
+  {
+    lprintf (0, "Error: ring directory is not set and ring is not volatile");
+    return 1;
+  }
+
+  /* Set server start time */
+  param.serverstarttime = NSnow ();
+
+  /* Initialize watchdog loop interval timers */
+  curtime = time (NULL);
+  chktime = curtime;
+
+  /* Initialize usage log window timers */
+  if (config.usagelog.mode)
+  {
+    if (CalcUsageLogInterval (curtime))
+    {
+      lprintf (0, "Error calculating interval time window");
+      return 1;
+    }
+  }
+
+  LogServerParameters ();
+
+  /* Set loop interval check tick to 1/4 second */
+  timereq.tv_sec  = 0;
+  timereq.tv_nsec = 250000000;
+
+  /* Watchdog loop: monitors the server and client threads
+     performing restarts and cleanup when necessary. */
+  for (;;)
+  {
+    hpcurtime = NSnow ();
+
+    /* If shutdown is requested signal all client threads */
+    if (param.shutdownsig == 1)
+    {
+      param.shutdownsig = 2;
+
+      /* Set shutdown loop throttle of .1 seconds */
+      timereq.tv_nsec = 100000000;
+
+      /* Request shutdown of server threads */
+      pthread_mutex_lock (&param.sthreads_lock);
+      loopstp = param.sthreads;
+      while (loopstp)
+      {
+        /* Close listening server sockets, causing the listen thread to exit too */
+        if (loopstp->type == LISTEN_THREAD)
+        {
+          ListenPortParams *lpp = loopstp->params;
+
+          if (lpp->socket > 0)
+          {
+            lprintf (3, "Closing port %s server socket", lpp->portstr);
+            shutdown (lpp->socket, SHUT_RDWR);
+            close (lpp->socket);
+            lpp->socket = -1;
+          }
+        }
+        /* Otherwise set thread flag to CLOSE */
+        else if (loopstp->td && (loopstp->td->td_state != TDS_CLOSING) && loopstp->td->td_state != TDS_CLOSED)
+        {
+          lprintf (3, "Requesting shutdown of server thread %lu",
+                   (unsigned long int)loopstp->td->td_id);
+
+          loopstp->td->td_state = TDS_CLOSE;
+        }
+
+        loopstp = loopstp->next;
+      }
+      pthread_mutex_unlock (&param.sthreads_lock);
+
+      /* Request shutdown of client threads */
+      pthread_mutex_lock (&param.cthreads_lock);
+      loopctp = param.cthreads;
+      while (loopctp)
+      {
+        if (loopctp->td->td_state != TDS_CLOSING && loopctp->td->td_state != TDS_CLOSED)
+        {
+          lprintf (3, "Requesting shutdown of client thread %lu",
+                   (unsigned long int)loopctp->td->td_id);
+
+          /* Only touch the socket for ACTIVE threads; CLOSING threads are
+             already mid-cleanup and their ClientInfo must not be dereferenced */
+          if (loopctp->td->td_state == TDS_ACTIVE)
+          {
+            ClientInfo *cinfo = (ClientInfo *)loopctp->td->td_prvtptr;
+            if (cinfo && cinfo->socket > 0)
+            {
+              struct linger linger_opt = {1, 1};
+              setsockopt (cinfo->socket, SOL_SOCKET, SO_LINGER, &linger_opt, sizeof (linger_opt));
+              shutdown (cinfo->socket, SHUT_RDWR);
+            }
+          }
+
+          loopctp->td->td_state = TDS_CLOSE;
+        }
+        loopctp = loopctp->next;
+      }
+      pthread_mutex_unlock (&param.cthreads_lock);
+    } /* Done initializing shutdown sequence */
+
+    if (param.shutdownsig > 1)
+    {
+      /* Safety valve for deadlock, should never get here */
+      if (param.shutdownsig >= 100)
+      {
+        lprintf (0, "Shutdown did not complete cleanly after ~10 seconds");
+        break;
+      }
+
+      param.shutdownsig++;
+    }
+
+    /* Usage log writing time window check */
+    if (config.usagelog.mode && !param.shutdownsig)
+    {
+      if (curtime >= config.usagelog.endint)
+        usage_interval_ended = 1;
+      else
+        usage_interval_ended = 0;
+    }
+
+    /* Loop through server thread list to monitor threads, print status and perform cleanup */
+    pthread_mutex_lock (&param.sthreads_lock);
+    loopstp             = param.sthreads;
+    server_thread_count = 0;
+    while (loopstp)
+    {
+      char *threadtype             = "";
+      void *(*threadfunc) (void *) = NULL;
+
+      stp     = loopstp;
+      loopstp = loopstp->next;
+
+      if (stp->type == LISTEN_THREAD)
+      {
+        threadtype = "Listen";
+        threadfunc = &ListenThread;
+      }
+      else if (stp->type == MSEEDSCAN_THREAD)
+      {
+        threadtype = "MSeedScan";
+        threadfunc = &MS_ScanThread;
+      }
+
+      /* Report status of server thread */
+      if (stp->td)
+      {
+        char *state;
+        if (stp->td->td_state == TDS_SPAWNING)
+          state = "SPAWNING";
+        else if (stp->td->td_state == TDS_ACTIVE)
+          state = "ACTIVE";
+        else if (stp->td->td_state == TDS_CLOSE)
+          state = "CLOSE";
+        else if (stp->td->td_state == TDS_CLOSING)
+          state = "CLOSING";
+        else if (stp->td->td_state == TDS_CLOSED)
+          state = "CLOSED";
+        else
+          state = "UNKNOWN";
+
+        lprintf (3, "Server thread (%s) %lu state: %s",
+                 threadtype, (unsigned long int)stp->td->td_id, state);
+
+        server_thread_count++;
+      }
+      else
+      {
+        lprintf (2, "Server thread (%s) not running", threadtype);
+      }
+
+      if (stp->type == LISTEN_THREAD)
+      {
+        ListenPortParams *lpp = stp->params;
+
+        /* Cleanup CLOSED listen thread */
+        if (stp->td && stp->td->td_state == TDS_CLOSED)
+        {
+          lprintf (1, "Joining CLOSED %s thread", threadtype);
+
+          if ((errno = pthread_join (stp->td->td_id, NULL)))
+          {
+            lprintf (0, "Error joining CLOSED %s thread %lu: %s", threadtype,
+                     (unsigned long int)stp->td->td_id, strerror (errno));
+          }
+
+          free (stp->td);
+          stp->td = NULL;
+        }
+
+        /* Start new listening thread if needed */
+        if (stp->td == NULL && !param.shutdownsig)
+        {
+          /* Initialize thread data and create thread */
+          if (!(stp->td = InitThreadData (lpp)))
+          {
+            lprintf (0, "Error initializing %s thread_data: %s", threadtype, strerror (errno));
+          }
+          else
+          {
+            lprintf (2, "Starting %s listen thread for port %s", threadtype, lpp->portstr);
+
+            if ((errno = pthread_create (&stid, NULL, threadfunc, (void *)stp->td)))
+            {
+              lprintf (0, "Error creating %s thread: %s", threadtype, strerror (errno));
+              if (stp->td)
+                free (stp->td);
+              stp->td = NULL;
+            }
+            else
+            {
+              stp->td->td_id = stid;
+            }
+          }
+        }
+      } /* Done with LISTEN_THREAD handling */
+      else if (stp->type == MSEEDSCAN_THREAD)
+      {
+        MSScanInfo *mssinfo = stp->params;
+
+        /* Cleanup CLOSED scanning thread */
+        if (stp->td && stp->td->td_state == TDS_CLOSED)
+        {
+          lprintf (1, "Joining CLOSED %s thread", threadtype);
+
+          if ((errno = pthread_join (stp->td->td_id, NULL)))
+          {
+            lprintf (0, "Error joining CLOSED %s thread %lu: %s", threadtype,
+                     (unsigned long int)stp->td->td_id, strerror (errno));
+          }
+
+          free (stp->td);
+          stp->td = NULL;
+        }
+
+        /* Start new thread if needed */
+        if (stp->td == NULL && !param.shutdownsig)
+        {
+          /* Initialize thread data and create thread */
+          if (!(stp->td = InitThreadData (mssinfo)))
+          {
+            lprintf (0, "Error initializing %s thread_data: %s", threadtype, strerror (errno));
+          }
+          else
+          {
+            lprintf (2, "Starting %s thread [%s]", threadtype, mssinfo->dirname);
+
+            if ((errno = pthread_create (&stid, NULL, threadfunc, (void *)stp->td)))
+            {
+              lprintf (0, "Error creating %s thread: %s", threadtype, strerror (errno));
+              if (stp->td)
+                free (stp->td);
+              stp->td = NULL;
+            }
+            else
+            {
+              stp->td->td_id = stid;
+            }
+          }
+        }
+      } /* Done with MSEEDSCAN_THREAD handling */
+      else
+      {
+        lprintf (0, "Error, unrecognized server thread type: %d", stp->type);
+      }
+
+    } /* Done looping through server threads */
+    pthread_mutex_unlock (&param.sthreads_lock);
+
+    /* Reset total count and byte rates */
+    txpacketrate = txbyterate = rxpacketrate = rxbyterate = 0.0;
+
+    /* Loop through client thread list printing status and doing cleanup */
+    pthread_mutex_lock (&param.cthreads_lock);
+    loopctp = param.cthreads;
+    while (loopctp)
+    {
+      ctp     = loopctp;
+      loopctp = loopctp->next;
+
+      char *state;
+      if (ctp->td->td_state == TDS_SPAWNING)
+        state = "SPAWNING";
+      else if (ctp->td->td_state == TDS_ACTIVE)
+        state = "ACTIVE";
+      else if (ctp->td->td_state == TDS_CLOSE)
+        state = "CLOSE";
+      else if (ctp->td->td_state == TDS_CLOSING)
+        state = "CLOSING";
+      else if (ctp->td->td_state == TDS_CLOSED)
+        state = "CLOSED";
+      else
+        state = "UNKNOWN";
+
+      lprintf (3, "Client thread %lu state: %s",
+               (unsigned long int)ctp->td->td_id, state);
+
+      /* Free associated resources and join CLOSED client threads */
+      if (ctp->td->td_state == TDS_CLOSED)
+      {
+        lprintf (3, "Removing client thread %lu from the cthreads list",
+                 (unsigned long int)ctp->td->td_id);
+
+        /* Unlink from the cthreads list */
+        if (!ctp->prev && !ctp->next)
+          param.cthreads = NULL;
+        if (!ctp->prev && ctp->next)
+          param.cthreads = ctp->next;
+        if (ctp->prev)
+          ctp->prev->next = ctp->next;
+        if (ctp->next)
+          ctp->next->prev = ctp->prev;
+
+        if ((errno = pthread_join (ctp->td->td_id, NULL)))
+        {
+          lprintf (0, "Error joining CLOSED thread %lu: %s",
+                   (unsigned long int)ctp->td->td_id, strerror (errno));
+        }
+
+        /* Free the ClientInfo structure stored at the prvtptr and destroy the streams_lock mutex */
+        if (ctp->td->td_prvtptr)
+        {
+          pthread_mutex_destroy (&((ClientInfo *)ctp->td->td_prvtptr)->streams_lock);
+          free (ctp->td->td_prvtptr);
+        }
+
+        /* Free thread data structure */
+        if (ctp->td)
+          free (ctp->td);
+
+        /* Decrement client count */
+        if (param.clientcount > 0)
+          param.clientcount--;
+
+        /* Free thread data */
+        free (ctp);
+      }
+      else if (ctp->td->td_state == TDS_ACTIVE)
+      {
+        /* Update transmission and reception rates */
+        CalcStats ((ClientInfo *)ctp->td->td_prvtptr);
+
+        /* Update packet and byte count totals */
+        txpacketrate += ((ClientInfo *)ctp->td->td_prvtptr)->txpacketrate;
+        txbyterate += ((ClientInfo *)ctp->td->td_prvtptr)->txbyterate;
+        rxpacketrate += ((ClientInfo *)ctp->td->td_prvtptr)->rxpacketrate;
+        rxbyterate += ((ClientInfo *)ctp->td->td_prvtptr)->rxbyterate;
+
+        /* Write transfer logs and reset byte counts */
+        if (usage_interval_ended)
+          WriteTransferLog ((ClientInfo *)ctp->td->td_prvtptr, 1);
+
+        /* Close idle clients if limit is set and exceeded */
+        if (config.clienttimeout &&
+            (hpcurtime - ((ClientInfo *)ctp->td->td_prvtptr)->lastxchange) > (config.clienttimeout * (nstime_t)NSTMODULUS))
+        {
+          lprintf (1, "Closing idle client connection: %s", ((ClientInfo *)ctp->td->td_prvtptr)->hostname);
+          ctp->td->td_state = TDS_CLOSE;
+        }
+      }
+    } /* Done looping through client threads */
+    pthread_mutex_unlock (&param.cthreads_lock);
+
+    lprintf (3, "Client connections: %d", param.clientcount);
+
+    /* Update count and byte rate ring parameters */
+    param.txpacketrate = txpacketrate;
+    param.txbyterate   = txbyterate;
+    param.rxpacketrate = rxpacketrate;
+    param.rxbyterate   = rxbyterate;
+
+    /* Check for config file updates */
+    if (config.configfile && !lstat (config.configfile, &cfstat))
+    {
+      if (cfstat.st_mtime > param.configfilemtime)
+      {
+        lprintf (1, "Re-reading configuration parameters from %s", config.configfile);
+
+        pthread_rwlock_wrlock (&config.config_rwlock);
+        ReadConfigFile (config.configfile, 1, cfstat.st_mtime);
+
+        /* Refresh cached usage-log filenames inside the same wrlock window
+         * so any new basedir/prefix/mode settings take effect atomically with
+         * the config change, avoiding a brief cache-inconsistency window. */
+        if (config.usagelog.mode && !param.shutdownsig)
+          CalcUsageLogInterval_locked (time (NULL));
+
+        pthread_rwlock_unlock (&config.config_rwlock);
+      }
+    }
+
+    /* Reset usage log writing time windows on interval rollover */
+    if (config.usagelog.mode && !param.shutdownsig && usage_interval_ended)
+    {
+      usage_interval_ended = 0;
+
+      if (CalcUsageLogInterval (time (NULL)))
+      {
+        lprintf (0, "Error calculating interval time window");
+        return 1;
+      }
+    }
+
+    /* All done if shutting down and no threads left */
+    if (param.shutdownsig >= 2 && param.clientcount == 0 && server_thread_count == 0)
+      break;
+
+    /* Throttle the loop during shutdown */
+    if (param.shutdownsig)
+    {
+      nanosleep (&timereq, NULL);
+    }
+    /* Otherwise, throttle the loop for a second, signals will interrupt */
+    else
+    {
+      while (((curtime = time (NULL)) - chktime) < 1 && !param.shutdownsig)
+        nanosleep (&timereq, NULL);
+    }
+
+    chktime = curtime;
+  } /* End of main watchdog loop */
+
+  if ((errno = pthread_cancel (sigtid)))
+  {
+    lprintf (0, "Error cancelling signal handling thread: %s", strerror (errno));
+    return 1;
+  }
+
+  if ((errno = pthread_join (sigtid, NULL)))
+  {
+    lprintf (0, "Error joining signal handling thread: %s", strerror (errno));
+    return 1;
+  }
+
+  /* Shutdown ring buffer */
+  if (config.ringdir || config.volatilering)
+  {
+    if (RingShutdown (ringfd, streamfilename))
+    {
+      lprintf (0, "Error shutting down ring buffer");
+      return 1;
+    }
+  }
+
+  /* A final sync() */
+  sync ();
+
+  return 0;
+} /* End of main() */
+
+/***********************************************************************
+ * InitThreadData:
+ *
+ * Initialize thread data.
+ *
+ * Return pointer to thread_data on success and 0 on error.
+ ***********************************************************************/
+struct thread_data *
+InitThreadData (void *prvtptr)
+{
+  struct thread_data *rtdp;
+
+  rtdp = (struct thread_data *)malloc (sizeof (struct thread_data));
+
+  if (!rtdp)
+  {
+    lprintf (0, "Error malloc'ing thread_data: %s", strerror (errno));
+    return 0;
+  }
+
+  rtdp->td_id    = 0;
+  rtdp->td_state = TDS_SPAWNING;
+
+  rtdp->td_prvtptr = prvtptr;
+
+  return rtdp;
+} /* End of InitThreadData() */
+
+/***********************************************************************
+ * FreeClientInfo:
+ *
+ * Free a partially or fully initialized ClientInfo structure and all
+ * resources allocated by ConfigClient() and ListenThread() prior to
+ * client thread creation.
+ ***********************************************************************/
+static void
+FreeClientInfo (ClientInfo *cinfo)
+{
+  if (cinfo == NULL)
+    return;
+
+  free (cinfo->addr);
+  free (cinfo->allowedstr);
+  free (cinfo->forbiddenstr);
+  free (cinfo->mswrite);
+  pthread_mutex_destroy (&cinfo->streams_lock);
+  free (cinfo);
+}
+
+/***********************************************************************
+ * ConfigureTCPKeepAlive:
+ *
+ * Apply TCP keepalive socket options to an accepted client socket using
+ * the current config.tcpkeepalive_* values.  A value of 0 for
+ * tcpkeepalive_idle disables keepalives entirely and is a no-op.
+ *
+ * TCP_KEEPINTVL and TCP_KEEPCNT are set only when the platform supports
+ * them; the #ifdef guards are compile-time.
+ ***********************************************************************/
+static void
+ConfigureTCPKeepAlive (int sock, const char *peer)
+{
+  uint32_t idle  = config.tcpkeepalive_idle;
+  uint32_t intvl = config.tcpkeepalive_interval;
+  uint32_t cnt   = config.tcpkeepalive_count;
+  int one        = 1;
+
+  if (idle == 0)
+    return;
+
+  if (setsockopt (sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof (one)))
+    lprintf (0, "[%s] setsockopt(SO_KEEPALIVE): %s", peer, strerror (errno));
+
+#if defined(TCP_KEEPIDLE)
+  if (setsockopt (sock, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof (idle)))
+    lprintf (0, "[%s] setsockopt(TCP_KEEPIDLE): %s", peer, strerror (errno));
+#elif defined(TCP_KEEPALIVE) /* macOS uses TCP_KEEPALIVE for the idle interval */
+  if (setsockopt (sock, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof (idle)))
+    lprintf (0, "[%s] setsockopt(TCP_KEEPALIVE): %s", peer, strerror (errno));
+#endif
+
+#if defined(TCP_KEEPINTVL)
+  if (intvl > 0 &&
+      setsockopt (sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof (intvl)))
+    lprintf (0, "[%s] setsockopt(TCP_KEEPINTVL): %s", peer, strerror (errno));
+#endif
+
+#if defined(TCP_KEEPCNT)
+  if (cnt > 0 &&
+      setsockopt (sock, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof (cnt)))
+    lprintf (0, "[%s] setsockopt(TCP_KEEPCNT): %s", peer, strerror (errno));
+#endif
+} /* End of ConfigureTCPKeepAlive() */
+
+/***********************************************************************
+ * ListenThread:
+ *
+ * Thread to accept connections and dispatch client threads.
+ *
+ * Return NULL.
+ ***********************************************************************/
+void *
+ListenThread (void *arg)
+{
+  pthread_t ctid;
+  int clientsocket;
+  struct thread_data *mytdp;
+  struct thread_data *tdp;
+  struct cthread *ctp;
+  ClientInfo *cinfo;
+  ListenPortParams *lpp;
+
+  char ipstr[100];
+  char portstr[32];
+  char protocolstr[100];
+
+  struct sockaddr_storage addr_storage;
+  struct sockaddr *paddr = (struct sockaddr *)&addr_storage;
+  socklen_t addrlen;
+  int one = 1;
+
+  uint16_t proxy_dest_port = 0;
+
+  mytdp = (struct thread_data *)arg;
+  lpp   = (ListenPortParams *)mytdp->td_prvtptr;
+
+  /* Set thread active status */
+  mytdp->td_state = TDS_ACTIVE;
+
+  /* Generate string of protocols and options supported by this listener */
+  if (GenProtocolString (lpp->protocols, lpp->options, protocolstr, sizeof (protocolstr)) > 0)
+    lprintf (1, "Listening for connections on port %s (%s)",
+             lpp->portstr, protocolstr);
+  else
+    lprintf (1, "Listening for connections on port %s (unknown protocols?)",
+             lpp->portstr);
+
+  /* Enter connection dispatch loop, spawning a new thread for each incoming connection */
+  while (!param.shutdownsig)
+  {
+    addrlen = sizeof (addr_storage);
+
+    /* Process next connection in queue */
+    clientsocket = accept (lpp->socket, paddr, &addrlen);
+
+    /* Check for accept errors */
+    if (clientsocket == -1)
+    {
+      /* Continue listening on these non-fatal errors */
+      if (errno == ECONNABORTED || errno == EINTR)
+        continue;
+
+      /* If not shutting down this is a connection error */
+      if (!param.shutdownsig)
+        lprintf (0, "Could not accept incoming connection: %s", strerror (errno));
+
+      break;
+    }
+
+    /* Turn off TCP delay algorithm (Nagle) */
+    if (setsockopt (clientsocket, tcpprotonumber, TCP_NODELAY, (void *)&one, sizeof (one)))
+    {
+      lprintf (0, "Could not disable TCP delay algorithm: %s", strerror (errno));
+    }
+
+    /* Tune socket send/receive buffers for high-throughput SeedLink streaming.
+     * 256 KiB send buffer: enough to hold ~50 typical 512-byte miniSEED records
+     * in flight without blocking the client thread, even at 1000+ clients.
+     * 64 KiB receive buffer: SeedLink clients send very few commands; small is fine.
+     * These are hints; the kernel may clamp them to net.core.{w,r}mem_max. */
+    {
+      int sndbuf = 256 * 1024;
+      int rcvbuf = 64  * 1024;
+      if (setsockopt (clientsocket, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof (sndbuf)))
+        lprintf (2, "[%s] setsockopt(SO_SNDBUF): %s", ipstr, strerror (errno));
+      if (setsockopt (clientsocket, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof (rcvbuf)))
+        lprintf (2, "[%s] setsockopt(SO_RCVBUF): %s", ipstr, strerror (errno));
+    }
+
+    /* Read PROXY protocol v2 header when the listener is configured for it */
+    if (lpp->options & PROXY_PROTOCOL_V2)
+    {
+      /* Use the configured network I/O timeout for the PROXY header read.
+       * Fall back to a fixed maximum when netiotimeout is disabled. */
+      int proxy_timeout_ms = (config.netiotimeout > 0)
+                                 ? (int)config.netiotimeout * 1000
+                                 : PROXY_HEADER_TIMEOUT_MAX_MS;
+
+      int ppresult = ProxyProtocolV2Read (clientsocket, proxy_timeout_ms, &addr_storage, &addrlen,
+                                          &proxy_dest_port);
+      if (ppresult < 0)
+      {
+        lprintf (1, "Closing connection: failed to read PROXY protocol v2 header");
+        close (clientsocket);
+        continue;
+      }
+      /* ppresult == 0: PROXY command, addr_storage updated with real client address
+       * ppresult == 1: LOCAL command, addr_storage unchanged (keep accept() address) */
+      paddr = (struct sockaddr *)&addr_storage;
+    }
+
+    /* Generate IP address and port number strings */
+    if (getnameinfo (paddr, addrlen, ipstr, sizeof (ipstr), portstr, sizeof (portstr),
+                     NI_NUMERICHOST | NI_NUMERICSERV))
+    {
+      lprintf (0, "Error creating IP and port strings");
+      close (clientsocket);
+      continue;
+    }
+
+    lprintf (2, "Incoming connection on port %s from %s:%s", lpp->portstr, ipstr, portstr);
+
+    /* Apply TCP keepalive socket options for dead-peer detection */
+    ConfigureTCPKeepAlive (clientsocket, ipstr);
+
+    /* Configure client connection */
+    pthread_rwlock_rdlock (&config.config_rwlock);
+    cinfo = ConfigClient (paddr, clientsocket, lpp, ipstr, portstr);
+    pthread_rwlock_unlock (&config.config_rwlock);
+
+    if (cinfo == NULL)
+    {
+      close (clientsocket);
+      continue;
+    }
+
+    /* Override serverport with the destination port from PROXY protocol header */
+    if (proxy_dest_port)
+      snprintf (cinfo->serverport, sizeof (cinfo->serverport), "%u", proxy_dest_port);
+
+    /* Store client socket address structure */
+    if ((cinfo->addr = (struct sockaddr *)malloc (addrlen)) == NULL)
+    {
+      lprintf (0, "Error allocating memory for socket structure");
+      close (clientsocket);
+      FreeClientInfo (cinfo);
+      break;
+    }
+
+    memcpy (cinfo->addr, &addr_storage, addrlen);
+    cinfo->addrlen = addrlen;
+
+    /* Create new client thread */
+    if (!(tdp = InitThreadData (cinfo)))
+    {
+      lprintf (0, "Error initializing thread_data: %s", strerror (errno));
+      close (clientsocket);
+      FreeClientInfo (cinfo);
+      break;
+    }
+
+    /* Allocate the tracking entry before starting the thread */
+    ctp = (struct cthread *)malloc (sizeof (struct cthread));
+    if (ctp == NULL)
+    {
+      lprintf (0, "Error allocating cthread: %s", strerror (errno));
+      close (clientsocket);
+      FreeClientInfo (cinfo);
+      free (tdp);
+      tdp = NULL;
+      continue;
+    }
+
+    /* Use a reduced stack size for client threads.
+     * Default pthread stack is 8 MiB; at 1000 clients that is 8 GiB of
+     * virtual address space.  256 KiB is more than sufficient for the
+     * ClientThread call depth and reduces VAS pressure dramatically. */
+    {
+      pthread_attr_t attr;
+      pthread_attr_init (&attr);
+      pthread_attr_setstacksize (&attr, 256 * 1024);
+      errno = pthread_create (&ctid, &attr, ClientThread, (void *)tdp);
+      pthread_attr_destroy (&attr);
+    }
+    if (errno)
+    {
+      lprintf (0, "Error creating new client thread: %s", strerror (errno));
+      close (clientsocket);
+      FreeClientInfo (cinfo);
+      free (tdp);
+      free (ctp);
+      tdp = NULL;
+      continue;
+    }
+
+    ctp->td   = tdp;
+    ctp->prev = NULL;
+
+    /* Record the thread ID */
+    tdp->td_id = ctid;
+
+    /* Add ctp to the beginning of the client threads list (cthreads) */
+    pthread_mutex_lock (&param.cthreads_lock);
+    if (param.cthreads)
+    {
+      ctp->next            = param.cthreads;
+      param.cthreads->prev = ctp;
+    }
+    else
+    {
+      ctp->next = NULL;
+    }
+    param.cthreads = ctp;
+    param.clientcount++;
+    pthread_mutex_unlock (&param.cthreads_lock);
+  }
+
+  /* Set thread closing status */
+  mytdp->td_state = TDS_CLOSED;
+
+  lprintf (1, "Listening thread closing");
+
+  return NULL;
+} /* End of ListenThread() */
+
+/***********************************************************************
+ * ConfigClient:
+ *
+ * Configure a client connection.
+ *
+ * Return an allocated ClientInfo structure on success and NULL on error.
+ ***********************************************************************/
+ClientInfo *
+ConfigClient (struct sockaddr *paddr, int clientsocket,
+              const ListenPortParams *lpp,
+              const char *ipstr, const char *portstr)
+{
+  ClientInfo *cinfo;
+
+  /* Deny clients not in accept IP list */
+  if (config.acceptips)
+  {
+    if (!MatchIP (config.acceptips, paddr))
+    {
+      lprintf (1, "Denying connection not in accept list from: %s:%s", ipstr, portstr);
+      return NULL;
+    }
+  }
+
+  /* Deny clients in the deny IP list */
+  if (config.denyips)
+  {
+    if (MatchIP (config.denyips, paddr))
+    {
+      lprintf (1, "Denying connection in deny list from: %s:%s", ipstr, portstr);
+      return NULL;
+    }
+  }
+
+  /* Enforce per-address connection limit for non write permission addresses */
+  if (config.maxclientsperip)
+  {
+    if (!(config.writeips && MatchIP (config.writeips, paddr)))
+    {
+      if (ClientIPCount (paddr) >= config.maxclientsperip)
+      {
+        lprintf (1, "Too many connections from: %s:%s", ipstr, portstr);
+        return NULL;
+      }
+    }
+  }
+
+  /* Enforce maximum number of clients if specified */
+  if (config.maxclients && param.clientcount >= config.maxclients)
+  {
+    if ((config.writeips && MatchIP (config.writeips, paddr)) &&
+        param.clientcount <= (config.maxclients + RESERVECONNECTIONS))
+    {
+      lprintf (1, "Accepting connection in reserve space from %s:%s", ipstr, portstr);
+    }
+    else
+    {
+      lprintf (1, "Maximum number of clients exceeded: %u", config.maxclients);
+      lprintf (1, "  Denying connection from: %s:%s", ipstr, portstr);
+      return NULL;
+    }
+  }
+
+  /* Allocate and initialize connection info struct */
+  if ((cinfo = (ClientInfo *)calloc (1, sizeof (ClientInfo))) == NULL)
+  {
+    lprintf (0, "Error allocating memory for connection info");
+    return NULL;
+  }
+
+  cinfo->socket    = clientsocket;
+  cinfo->protocols = lpp->protocols;
+  cinfo->tls       = (lpp->options & ENCRYPTION_TLS) ? 1 : 0;
+  cinfo->proxyv2   = (lpp->options & PROXY_PROTOCOL_V2) ? 1 : 0;
+  cinfo->state     = STATE_COMMAND;
+  cinfo->type      = CLIENT_UNDETERMINED;
+  cinfo->starttime = NSTUNSET;
+  cinfo->endtime   = NSTUNSET;
+
+  /* Initialize streams lock */
+  pthread_mutex_init (&cinfo->streams_lock, NULL);
+
+  /* Store IP address and port number strings */
+  snprintf (cinfo->ipstr, sizeof (cinfo->ipstr), "%s", ipstr);
+  snprintf (cinfo->portstr, sizeof (cinfo->portstr), "%s", portstr);
+  snprintf (cinfo->serverport, sizeof (cinfo->serverport), "%s", lpp->portstr);
+  snprintf (cinfo->listenerport, sizeof (cinfo->listenerport), "%s", lpp->portstr);
+
+  /* Set allowed stream limit if specified for address */
+  if (config.allowedips)
+  {
+    IPNet *ipnet;
+
+    if ((ipnet = MatchIP (config.allowedips, paddr)))
+    {
+      cinfo->allowedstr = (ipnet->limitstr) ? strdup (ipnet->limitstr) : NULL;
+    }
+  }
+
+  /* Set forbidden stream limit if specified for address */
+  if (config.forbiddenips)
+  {
+    IPNet *ipnet;
+
+    if ((ipnet = MatchIP (config.forbiddenips, paddr)))
+    {
+      cinfo->forbiddenstr = (ipnet->limitstr) ? strdup (ipnet->limitstr) : NULL;
+    }
+  }
+
+  /* Default to connect permission only */
+  cinfo->permissions = CONNECT_PERMISSION;
+
+  /* Grant write permission if address is in the write list */
+  if (config.writeips)
+  {
+    if (MatchIP (config.writeips, paddr))
+    {
+      cinfo->permissions |= WRITE_PERMISSION;
+    }
+  }
+
+  /* Set trusted flag if address is in the trusted list */
+  if (config.trustedips)
+  {
+    if (MatchIP (config.trustedips, paddr))
+    {
+      cinfo->permissions |= TRUST_PERMISSION;
+    }
+  }
+
+  /* Grant trusted permission if listener port is configured with TRUSTED flag */
+  if (lpp->options & GRANT_TRUSTED)
+  {
+    cinfo->permissions |= TRUST_PERMISSION;
+  }
+
+  /* Set client connect time */
+  cinfo->conntime = NSnow ();
+
+  /* Initialize last data exchange time to the connect time */
+  cinfo->lastxchange = cinfo->conntime;
+
+  /* Initialize the miniSEED write parameters */
+  if (config.mseedarchive)
+  {
+    if (!(cinfo->mswrite = (DataStream *)malloc (sizeof (DataStream))))
+    {
+      lprintf (0, "Error allocating memory for miniSEED write parameters");
+      FreeClientInfo (cinfo);
+      return NULL;
+    }
+
+    cinfo->mswrite->path          = config.mseedarchive;
+    cinfo->mswrite->idletimeout   = config.mseedidleto;
+    cinfo->mswrite->maxopenfiles  = 50;
+    cinfo->mswrite->openfilecount = 0;
+    cinfo->mswrite->grouproot     = NULL;
+  }
+
+  return cinfo;
+} /* End of ConfigClient() */
+
+/***************************************************************************
+ * CalcStats:
+ *
+ * Calculate statistics for the specified client connection.  This
+ * includes the following calculations:
+ *
+ * 1) Percent lag in the ring buffer, with the latest packet
+ * representing 0% lag and the earliest packet representing 100% lag.
+ *
+ * 2) Transmission and reception rates in Hz (packet count and bytes).
+ *
+ * This routine assumes that the packet and byte counts will always
+ * increase.
+ *
+ * Returns 0 on success and -1 on error.
+ ***************************************************************************/
+static int
+CalcStats (ClientInfo *cinfo)
+{
+  RingReader *reader;
+  nstime_t nsnow;
+  int64_t earliestoffset;
+  int64_t latestoffset;
+  int64_t latestoffset_unwrapped;
+  int64_t readeroffset_unwrapped;
+  double deltasec;
+
+  if (!cinfo)
+    return -1;
+
+  reader = cinfo->reader;
+  nsnow  = NSnow ();
+
+  earliestoffset = param.earliestoffset;
+  latestoffset   = param.latestoffset;
+
+  /* Determine percent lag if the current pktid is set */
+  if (reader && reader->pktid <= RINGID_MAXIMUM)
+  {
+    int64_t ringmod = param.maxoffset + config.pktsize;
+
+    if (latestoffset < earliestoffset)
+      latestoffset_unwrapped = latestoffset + ringmod;
+    else
+      latestoffset_unwrapped = latestoffset;
+
+    if (reader->pktoffset < earliestoffset)
+      readeroffset_unwrapped = reader->pktoffset + ringmod;
+    else
+      readeroffset_unwrapped = reader->pktoffset;
+
+    /* Calculate percentage lag as position in ring where 0% = latest offset and 100% = earliest offset */
+    if (latestoffset_unwrapped != earliestoffset)
+    {
+      cinfo->percentlag = (int)(((double)(latestoffset_unwrapped - readeroffset_unwrapped) / (latestoffset_unwrapped - earliestoffset)) * 100);
+
+      /* Enforce bounds on percentage lag */
+      if (cinfo->percentlag < 0)
+        cinfo->percentlag = 0;
+      else if (cinfo->percentlag > 100)
+        cinfo->percentlag = 100;
+    }
+    else
+    {
+      cinfo->percentlag = 0;
+    }
+  }
+  else
+  {
+    cinfo->percentlag = 0;
+  }
+
+  /* On first call, initialize history values and timestamp, skip rate calculation */
+  if (cinfo->ratetime == 0)
+  {
+    cinfo->txpackets1 = cinfo->txpackets0;
+    cinfo->txbytes1   = cinfo->txbytes0;
+    cinfo->rxpackets1 = cinfo->rxpackets0;
+    cinfo->rxbytes1   = cinfo->rxbytes0;
+    cinfo->ratetime   = nsnow;
+
+    return 0;
+  }
+
+  /* Determine time difference since the previous history values were set in seconds */
+  deltasec = (double)(nsnow - cinfo->ratetime) / NSTMODULUS;
+
+  if (deltasec <= 0.0)
+    return 0;
+
+  /* EMA smoothing factor: 0.25 gives ~4 second effective averaging window */
+  double alpha = 0.25;
+
+  /* Transmission */
+  if (cinfo->txpackets0 > 0)
+  {
+    /* Calculate instantaneous transmission rates and smooth with EMA */
+    double txpktrate_inst  = (double)(cinfo->txpackets0 - cinfo->txpackets1) / deltasec;
+    double txbyterate_inst = (double)(cinfo->txbytes0 - cinfo->txbytes1) / deltasec;
+    cinfo->txpacketrate    = alpha * txpktrate_inst + (1.0 - alpha) * cinfo->txpacketrate;
+    cinfo->txbyterate      = alpha * txbyterate_inst + (1.0 - alpha) * cinfo->txbyterate;
+
+    /* Shift current values to history values */
+    cinfo->txpackets1 = cinfo->txpackets0;
+    cinfo->txbytes1   = cinfo->txbytes0;
+  }
+
+  /* Reception */
+  if (cinfo->rxpackets0 > 0)
+  {
+    /* Calculate instantaneous reception rates and smooth with EMA */
+    double rxpktrate_inst  = (double)(cinfo->rxpackets0 - cinfo->rxpackets1) / deltasec;
+    double rxbyterate_inst = (double)(cinfo->rxbytes0 - cinfo->rxbytes1) / deltasec;
+    cinfo->rxpacketrate    = alpha * rxpktrate_inst + (1.0 - alpha) * cinfo->rxpacketrate;
+    cinfo->rxbyterate      = alpha * rxbyterate_inst + (1.0 - alpha) * cinfo->rxbyterate;
+
+    /* Shift current values to history values */
+    cinfo->rxpackets1 = cinfo->rxpackets0;
+    cinfo->rxbytes1   = cinfo->rxbytes0;
+  }
+
+  /* Update time stamp of history values */
+  cinfo->ratetime = nsnow;
+
+  return 0;
+} /* End of CalcStats() */
+
+/***************************************************************************
+ * MatchIP:
+ *
+ * Search the specified IPNet list for an entry that matches the given
+ * IP address.
+ *
+ * Returns the matching IPNet entry if match found and NULL if no match found.
+ ***************************************************************************/
+static IPNet *
+MatchIP (IPNet *list, struct sockaddr *addr)
+{
+  IPNet *net                = list;
+  struct in_addr *testnet   = &((struct sockaddr_in *)addr)->sin_addr;
+  struct in6_addr *testnet6 = &((struct sockaddr_in6 *)addr)->sin6_addr;
+
+  if (!list)
+    return NULL;
+
+  /* Sanity, only IPv4 and IPv6 addresses */
+  if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6)
+    return NULL;
+
+  /* Search IPNet list for a matching entry for addr */
+  while (net)
+  {
+    /* Check for match between test network and list network */
+    if (addr->sa_family == AF_INET && net->family == AF_INET)
+    {
+      if ((testnet->s_addr & net->netmask.in_addr.s_addr) == net->network.in_addr.s_addr)
+      {
+        return net;
+      }
+    }
+    else if (addr->sa_family == AF_INET6 && net->family == AF_INET6)
+    {
+      uint8_t masked[16];
+      for (int i = 0; i < 16; i++)
+        masked[i] = testnet6->s6_addr[i] & net->netmask.in6_addr.s6_addr[i];
+
+      if (memcmp (masked, net->network.in6_addr.s6_addr, 16) == 0)
+      {
+        return net;
+      }
+    }
+
+    net = net->next;
+  }
+
+  return NULL;
+} /* End of MatchIP() */
+
+/***************************************************************************
+ * ClientIPCount:
+ *
+ * Search the global client list and return a count of the connected
+ * clients that match the specified address.
+ *
+ * Returns count of the client connections with a matching address.
+ ***************************************************************************/
+static int
+ClientIPCount (struct sockaddr *addr)
+{
+  struct cthread *ctp;
+  struct sockaddr_in *tsin[2];
+  struct sockaddr_in6 *tsin6[2];
+  int addrcount = 0;
+
+  pthread_mutex_lock (&param.cthreads_lock);
+  ctp = param.cthreads;
+  while (ctp)
+  {
+    /* Only dereference ClientInfo for ACTIVE threads (invariant: see ClientThread) */
+    if (ctp->td && ctp->td->td_state == TDS_ACTIVE &&
+        ctp->td->td_prvtptr &&
+        ((ClientInfo *)ctp->td->td_prvtptr)->addr)
+    {
+      /* If the same IP protocol family */
+      if (((ClientInfo *)ctp->td->td_prvtptr)->addr->sa_family == addr->sa_family)
+      {
+        /* Compare IPv4 addresses */
+        if (addr->sa_family == AF_INET)
+        {
+          tsin[0] = (struct sockaddr_in *)((ClientInfo *)ctp->td->td_prvtptr)->addr;
+          tsin[1] = (struct sockaddr_in *)addr;
+
+          if (0 == memcmp (&tsin[0]->sin_addr.s_addr,
+                           &tsin[1]->sin_addr.s_addr,
+                           sizeof (tsin[0]->sin_addr.s_addr)))
+          {
+            addrcount++;
+          }
+        }
+        /* Compare IPv6 addresses */
+        else if (addr->sa_family == AF_INET6)
+        {
+          tsin6[0] = (struct sockaddr_in6 *)((ClientInfo *)ctp->td->td_prvtptr)->addr;
+          tsin6[1] = (struct sockaddr_in6 *)addr;
+
+          if (0 == memcmp (&tsin6[0]->sin6_addr.s6_addr,
+                           &tsin6[1]->sin6_addr.s6_addr,
+                           sizeof (tsin6[0]->sin6_addr.s6_addr)))
+          {
+            addrcount++;
+          }
+        }
+      }
+    }
+
+    ctp = ctp->next;
+  }
+  pthread_mutex_unlock (&param.cthreads_lock);
+
+  return addrcount;
+} /* End of ClientIPCount() */
+
+/***************************************************************************
+ * GenProtocolString:
+ *
+ * Generate a string containing the given protocols and options.
+ *
+ * Return length of string in result on success or 0 for error.
+ ***************************************************************************/
+int
+GenProtocolString (ListenProtocols protocols, ListenOptions options,
+                   char *result, size_t maxlength)
+{
+  int length;
+  char *family;
+
+  if (!result)
+    return 0;
+
+  if (options & FAMILY_IPv4)
+    family = "IPv4";
+  else if (options & FAMILY_IPv6)
+    family = "IPv6";
+  else
+    family = "Unknown family?";
+
+  length = snprintf (result, maxlength,
+                     "%s: %s%s%s%s%s%s",
+                     family,
+                     (protocols & PROTO_DATALINK) ? "DataLink " : "",
+                     (protocols & PROTO_SEEDLINK) ? "SeedLink " : "",
+                     (protocols & PROTO_HTTP) ? "HTTP " : "",
+                     (options & ENCRYPTION_TLS) ? "over TLS " : "",
+                     (options & PROXY_PROTOCOL_V2) ? "with PROXYv2 " : "",
+                     (options & GRANT_TRUSTED) ? "GRANT_TRUSTED " : "");
+
+  if (length > 0 && length < maxlength && result[length - 1] == ' ')
+    result[length - 1] = '\0';
+
+  return (length > maxlength) ? maxlength - 1 : length;
+} /* End of GenProtocolString() */
+
+/***********************************************************************
+ * SignalThread:
+ *
+ * Thread to handle signals.
+ *
+ * Return NULL.
+ ***********************************************************************/
+void *
+SignalThread (void *arg)
+{
+  (void)arg; /* Suppress compiler warning */
+  int sig;
+  int rc;
+
+  /* Remove SIGPIPE from complete set, it will remain blocked */
+  if (sigdelset (&globalsigset, SIGPIPE))
+  {
+    lprintf (0, "Error: sigdelset() failed, cannot remove SIGPIPE");
+  }
+
+  for (;;)
+  {
+    if ((rc = sigwait (&globalsigset, &sig)))
+    {
+      lprintf (0, "Error: sigwait() failed with %d", rc);
+      continue;
+    }
+
+    switch (sig)
+    {
+    case SIGINT:
+    case SIGTERM:
+      lprintf (1, "Received termination signal");
+      param.shutdownsig   = 1; /* Set global termination flag */
+      config.netiotimeout = 0; /* Disable network IO timeout */
+      break;
+    case SIGUSR1:
+      PrintHandler (); /* Print global ring details */
+      break;
+    case SIGSEGV:
+      lprintf (0, "Received segmentation fault signal, exiting");
+      exit (1);
+      break;
+    default:
+      lprintf (0, "Summarily ignoring %s (%d) signal", strsignal (sig), sig);
+      break;
+    }
+  }
+
+  return NULL;
+} /* End of SignalThread() */
+
+/***************************************************************************
+ * LogServerParameters:
+ *
+ * Log high-level server parameters, not ring buffer specific.
+ ***************************************************************************/
+void
+LogServerParameters (void)
+{
+  RingPacket packet;
+  uint64_t pktid;
+  char network[INET6_ADDRSTRLEN];
+  char netmask[INET6_ADDRSTRLEN];
+  char timestr[50];
+  char sizestr[50];
+
+  /* Ring buffer parameters */
+  HumanSizeString (param.ringsize, sizestr, sizeof (sizestr));
+
+  lprintf (1, "Ring parameters, buffer version: %u", param.version);
+  lprintf (1, "   ringsize: %" PRIu64 " (%s), pktsize: %u (%zu payload)",
+           param.ringsize, sizestr,
+           config.pktsize,
+           config.pktsize - sizeof (RingPacket));
+
+  lprintf (2, "   headersize: %u", param.headersize);
+
+  lprintf (2, "   maxpackets: %" PRIu64 ", maxoffset: %" PRId64,
+           param.maxpackets, param.maxoffset);
+
+  lprintf (2, "   streamcount: %u", param.streamcount);
+
+  lprintf (2, "   volatile: %s, mmap: %s",
+           (config.volatilering) ? "yes" : "no",
+           (config.memorymapring) ? "yes" : "no");
+
+  pktid = RingReadPacket (param.earliestoffset, &packet, NULL);
+  if (pktid != RINGID_NONE && pktid != RINGID_ERROR)
+  {
+    lprintf (2, "   earliest packet ID: %" PRIu64 ", offset: %" PRId64, pktid, packet.offset);
+    ms_nstime2timestr_n (packet.pkttime, timestr, sizeof (timestr), ISOMONTHDAY_Z, NANO_MICRO_NONE);
+    lprintf (2, "   earliest packet creation time: %s", timestr);
+    ms_nstime2timestr_n (packet.datastart, timestr, sizeof (timestr), ISOMONTHDAY_Z, NANO_MICRO_NONE);
+    lprintf (2, "   earliest packet data start time: %s", timestr);
+  }
+  else
+  {
+    lprintf (2, "   earliest packet ID: NONE");
+  }
+
+  pktid = RingReadPacket (param.latestoffset, &packet, NULL);
+  if (pktid != RINGID_NONE && pktid != RINGID_ERROR)
+  {
+    lprintf (2, "   latest packet ID: %" PRIu64 ", offset: %" PRId64, pktid, packet.offset);
+    ms_nstime2timestr_n (packet.pkttime, timestr, sizeof (timestr), ISOMONTHDAY_Z, NANO_MICRO_NONE);
+    lprintf (2, "   latest packet creation time: %s", timestr);
+    ms_nstime2timestr_n (packet.datastart, timestr, sizeof (timestr), ISOMONTHDAY_Z, NANO_MICRO_NONE);
+    lprintf (2, "   latest packet data start time: %s", timestr);
+  }
+  else
+  {
+    lprintf (2, "   latest packet ID: NONE");
+  }
+
+  /* Configuration parameters */
+  pthread_rwlock_rdlock (&config.config_rwlock);
+
+  lprintf (1, "Config parameters:");
+  lprintf (1, "   server ID: %s", config.serverid);
+  lprintf (1, "   ring directory: %s", (config.ringdir) ? config.ringdir : "NONE");
+  lprintf (1, "   max clients: %u%s", config.maxclients,
+           (config.maxclients == 0) ? " (no limit)" : "");
+  lprintf (1, "   max clients per IP: %u%s", config.maxclientsperip,
+           (config.maxclientsperip == 0) ? " (no limit)" : "");
+
+  lprintf (2, "   configuration file: %s", (config.configfile) ? config.configfile : "NONE");
+  lprintf (2, "   client timeout: %u seconds", config.clienttimeout);
+  lprintf (2, "   network I/O timeout: %u seconds", config.netiotimeout);
+  lprintf (2, "   TCP keepalive idle: %u seconds%s", config.tcpkeepalive_idle,
+           (config.tcpkeepalive_idle == 0) ? " (disabled)" : "");
+  lprintf (2, "   TCP keepalive interval: %u seconds", config.tcpkeepalive_interval);
+  lprintf (2, "   TCP keepalive count: %u", config.tcpkeepalive_count);
+  lprintf (2, "   time window limit: %.0f%%", config.timewinlimit * 100);
+  lprintf (2, "   resolve hostnames: %s", (config.resolvehosts) ? "yes" : "no");
+  lprintf (2, "   auto recovery: %u", config.autorecovery);
+  lprintf (2, "   TLS certificate file: %s", (config.tlscertfile) ? config.tlscertfile : "NONE");
+  lprintf (2, "   TLS key file: %s", (config.tlskeyfile) ? config.tlskeyfile : "NONE");
+  lprintf (2, "   TLS verify client certificate: %s", (config.tlsverifyclientcert) ? "yes" : "no");
+
+  lprintf (2, "   auth program: %s", (config.auth.program) ? config.auth.program : "NONE");
+  if (config.auth.argv != NULL)
+  {
+    for (char **arg = config.auth.argv; *arg != NULL; arg++)
+    {
+      lprintf (2, "     auth program argument: %s", *arg);
+    }
+  }
+  lprintf (2, "   auth required: %s", (config.auth.required) ? "yes" : "no");
+  lprintf (2, "   auth timeout: %u seconds", config.auth.timeout_sec);
+
+  lprintf (3, "   web root: %s", (config.webroot) ? config.webroot : "NONE");
+  lprintf (3, "   HTTP headers: %s", (config.httpheaders) ? config.httpheaders : "NONE");
+  lprintf (3, "   miniSEED archive: %s", (config.mseedarchive) ? config.mseedarchive : "NONE");
+  lprintf (3, "   miniSEED idle file timeout: %u seconds", config.mseedidleto);
+
+  lprintf (3, "   usage log: %s", (config.usagelog.basedir) ? config.usagelog.basedir : "NONE");
+  if (config.usagelog.basedir && config.verbose >= 3)
+  {
+    lprintf (3, "     log prefix: %s", (config.usagelog.prefix) ? config.usagelog.prefix : "NONE");
+    lprintf (3, "     log interval: %d seconds", config.usagelog.interval);
+    lprintf (3, "     log transmission: %s", (config.usagelog.mode & USAGELOG_TX) ? "yes" : "no");
+    lprintf (3, "     log reception: %s", (config.usagelog.mode & USAGELOG_RX) ? "yes" : "no");
+    lprintf (3, "     log access: %s", (config.usagelog.mode & USAGELOG_ACCESS) ? "yes" : "no");
+
+    if (config.usagelog.startint)
+    {
+      ms_nstime2timestr_n (MS_EPOCH2NSTIME (config.usagelog.startint), timestr, sizeof (timestr), ISOMONTHDAY_Z, NONE);
+      lprintf (3, "     log interval start: %s", timestr);
+    }
+    else
+    {
+      lprintf (3, "     log interval start: NONE");
+    }
+
+    if (config.usagelog.endint)
+    {
+      ms_nstime2timestr_n (MS_EPOCH2NSTIME (config.usagelog.endint), timestr, sizeof (timestr), ISOMONTHDAY_Z, NONE);
+      lprintf (3, "     log interval end: %s", timestr);
+    }
+    else
+    {
+      lprintf (3, "     log interval end: NONE");
+    }
+  }
+
+  if (config.allowedips && config.verbose >= 3)
+  {
+    IPNet *ipn = config.allowedips;
+    while (ipn)
+    {
+      inet_ntop (ipn->family, &ipn->network, network, sizeof (network));
+      inet_ntop (ipn->family, &ipn->netmask, netmask, sizeof (netmask));
+
+      lprintf (3, "   allowed streams IP range: %s/%s", network, netmask);
+      lprintf (3, "     allowed stream pattern: %s", (ipn->limitstr) ? ipn->limitstr : "NONE");
+
+      ipn = ipn->next;
+    }
+  }
+  else
+  {
+    lprintf (3, "   allowed IP: NONE");
+  }
+
+  if (config.forbiddenips && config.verbose >= 3)
+  {
+    IPNet *ipn = config.forbiddenips;
+    while (ipn)
+    {
+      inet_ntop (ipn->family, &ipn->network, network, sizeof (network));
+      inet_ntop (ipn->family, &ipn->netmask, netmask, sizeof (netmask));
+
+      lprintf (3, "   forbidden streams IP range: %s/%s", network, netmask);
+      lprintf (3, "     forbidden streams pattern: %s", (ipn->limitstr) ? ipn->limitstr : "NONE");
+
+      ipn = ipn->next;
+    }
+  }
+  else
+  {
+    lprintf (3, "   forbidden IP: NONE");
+  }
+
+  if (config.acceptips && config.verbose >= 3)
+  {
+    IPNet *ipn = config.acceptips;
+    while (ipn)
+    {
+      inet_ntop (ipn->family, &ipn->network, network, sizeof (network));
+      inet_ntop (ipn->family, &ipn->netmask, netmask, sizeof (netmask));
+
+      lprintf (3, "   accept IP range: %s/%s", network, netmask);
+
+      ipn = ipn->next;
+    }
+  }
+  else
+  {
+    lprintf (3, "   accept IP range: NONE");
+  }
+
+  if (config.denyips && config.verbose >= 3)
+  {
+    IPNet *ipn = config.denyips;
+    while (ipn)
+    {
+      inet_ntop (ipn->family, &ipn->network, network, sizeof (network));
+      inet_ntop (ipn->family, &ipn->netmask, netmask, sizeof (netmask));
+
+      lprintf (3, "   deny IP range: %s/%s", network, netmask);
+
+      ipn = ipn->next;
+    }
+  }
+  else
+  {
+    lprintf (3, "   deny IP range: NONE");
+  }
+
+  if (config.writeips && config.verbose >= 3)
+  {
+    IPNet *ipn = config.writeips;
+    while (ipn)
+    {
+      inet_ntop (ipn->family, &ipn->network, network, sizeof (network));
+      inet_ntop (ipn->family, &ipn->netmask, netmask, sizeof (netmask));
+
+      lprintf (3, "   write IP range: %s/%s", network, netmask);
+
+      ipn = ipn->next;
+    }
+  }
+  else
+  {
+    lprintf (3, "   write IP range: NONE");
+  }
+
+  if (config.trustedips && config.verbose >= 3)
+  {
+    IPNet *ipn = config.trustedips;
+    while (ipn)
+    {
+      inet_ntop (ipn->family, &ipn->network, network, sizeof (network));
+      inet_ntop (ipn->family, &ipn->netmask, netmask, sizeof (netmask));
+
+      lprintf (3, "   trusted IP range: %s/%s", network, netmask);
+
+      ipn = ipn->next;
+    }
+  }
+  else
+  {
+    lprintf (3, "   trusted IP range: NONE");
+  }
+
+  pthread_rwlock_unlock (&config.config_rwlock);
+
+} /* End of LogServerParameters() */
+
+/***************************************************************************
+ * PrintHandler (USR1 signal):
+ *
+ * Use a high verbosity for an explicit request to print details.
+ ***************************************************************************/
+static void
+PrintHandler (void)
+{
+  uint8_t verbose_save = config.verbose;
+  config.verbose       = 3;
+  LogServerParameters ();
+  config.verbose = verbose_save;
+}

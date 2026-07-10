@@ -1,0 +1,1589 @@
+/**************************************************************************
+ * clients.c
+ *
+ * General client thread definition and common utility functions
+ *
+ * This file is part of the ringserver.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Copyright (C) 2026:
+ * @author Chad Trabant, EarthScope Data Services
+ **************************************************************************/
+
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include "clients.h"
+#include "dlclient.h"
+#include "generic.h"
+#include "http.h"
+#include "logging.h"
+#include "rbtree.h"
+#include "slclient.h"
+#include "tls.h"
+
+/* Progressive throttle stepping and maximum in milliseconds.
+ * Aggressive values for high-throughput multi-client SeedLink streaming:
+ * - STEPPING: 5 ms  => fast ramp-up so idle detection is near-instant
+ * - MAXIMUM : 50 ms => caps sleep so a client never waits > 50 ms for
+ *   the next packet, keeping latency low under bursty write patterns.
+ * The previous 200 ms / 1000 ms values caused unacceptable head-of-line
+ * blocking when many clients were streaming simultaneously. */
+#define THROTTLE_STEPPING  5  /* 5 milliseconds */
+#define THROTTLE_MAXIMUM  50  /* 50 milliseconds */
+
+/* Maximum line length for line-based commands */
+#define MAX_LINE_LENGTH 8096
+
+/* Maximum number of streams tracked per client */
+#define MAX_STREAMS_PER_CLIENT 100000
+
+/* Maximum consecutive client errors before disconnecting */
+#define MAX_CONSECUTIVE_ERRORS 20
+
+static int ClientRecv (ClientInfo *cinfo);
+
+/* Test first 3 characters of buffer for HTTP methods:
+   GET, HEAD, POST, PUT, DELETE, TRACE and CONNECT */
+#define HTTPMETHOD(X) (                                  \
+    (*X == 'G' && *(X + 1) == 'E' && *(X + 2) == 'T') || \
+    (*X == 'H' && *(X + 1) == 'E' && *(X + 2) == 'A') || \
+    (*X == 'P' && *(X + 1) == 'O' && *(X + 2) == 'S') || \
+    (*X == 'P' && *(X + 1) == 'U' && *(X + 2) == 'T') || \
+    (*X == 'D' && *(X + 1) == 'E' && *(X + 2) == 'L') || \
+    (*X == 'T' && *(X + 1) == 'R' && *(X + 2) == 'A') || \
+    (*X == 'C' && *(X + 1) == 'O' && *(X + 2) == 'N'))
+
+/***********************************************************************
+ * ClientThread:
+ *
+ * Thread to handle all communications with a client.
+ *
+ * State-transition discipline for param.cthreads_lock:
+ *   All writes to mytdp->td_state that exit TDS_ACTIVE (i.e. the transitions
+ *   to TDS_CLOSING and TDS_CLOSED) must be performed while holding
+ *   param.cthreads_lock.  This guarantees that outside readers walking the
+ *   cthreads list under that lock see a consistent snapshot: they may
+ *   safely dereference ClientInfo fields only when td_state == TDS_ACTIVE,
+ *   and the lock acquisition provides the required happens-before ordering
+ *   so all cleanup writes are visible to the reaper before it joins the thread.
+ *
+ * Returns NULL.
+ ***********************************************************************/
+void *
+ClientThread (void *arg)
+{
+  ClientInfo *cinfo;
+  RingReader reader;
+  struct thread_data *mytdp;
+  int sentbytes;
+  int sockflags;
+  int setuperr = 0;
+  int nread;
+  int consecutive_errors = 0;
+
+  /* Throttle related */
+  uint32_t throttle_msec = 0; /* Throttle time in milliseconds */
+  struct timespec timereq;    /* Throttle for nanosleep() */
+
+  if (!arg)
+    return NULL;
+
+  mytdp = (struct thread_data *)arg;
+  cinfo = (ClientInfo *)mytdp->td_prvtptr;
+
+  /* Connect linked structures */
+  cinfo->reader = &reader;
+
+  /* Initialize RingReader parameters */
+  reader.pktoffset      = -1;
+  reader.pktid          = RINGID_NONE;
+  reader.pkttime        = NSTUNSET;
+  reader.allowed        = NULL;
+  reader.allowed_data   = NULL;
+  reader.forbidden      = NULL;
+  reader.forbidden_data = NULL;
+  reader.match          = NULL;
+  reader.match_data     = NULL;
+  reader.reject         = NULL;
+  reader.reject_data    = NULL;
+
+  /* Set initial state */
+  cinfo->state = STATE_COMMAND;
+
+  /* Resolve IP address to hostname */
+  if (config.resolvehosts)
+  {
+    if (getnameinfo (cinfo->addr, cinfo->addrlen,
+                     cinfo->hostname, sizeof (cinfo->hostname), NULL, 0, 0))
+    {
+      /* Copy numeric IP address into hostname on failure to resolve */
+      strncpy (cinfo->hostname, cinfo->ipstr, sizeof (cinfo->hostname) - 1);
+      cinfo->hostname[sizeof (cinfo->hostname) - 1] = '\0';
+    }
+  }
+  /* Otherwise use the numerical IP address as the hostname */
+  else
+  {
+    /* Copy numeric IP address into hostname when not resolving */
+    strncpy (cinfo->hostname, cinfo->ipstr, sizeof (cinfo->hostname) - 1);
+    cinfo->hostname[sizeof (cinfo->hostname) - 1] = '\0';
+  }
+
+  if (cinfo->proxyv2)
+  {
+    lprintf (1, "Client connected [%s PROXY destination %s]: %s [%s] port %s",
+             cinfo->listenerport, cinfo->serverport, cinfo->hostname, cinfo->ipstr, cinfo->portstr);
+  }
+  else
+  {
+    lprintf (1, "Client connected [%s]: %s [%s] port %s",
+             cinfo->listenerport, cinfo->hostname, cinfo->ipstr, cinfo->portstr);
+  }
+
+  WriteAccessLog (cinfo, "connect", NULL, NULL, NULL, NULL);
+
+  /* Initialize stream tracking binary tree */
+  pthread_mutex_lock (&(cinfo->streams_lock));
+  cinfo->streams      = RBTreeCreate (KeyCompare, free, free);
+  cinfo->streamscount = 0;
+  pthread_mutex_unlock (&(cinfo->streams_lock));
+
+  if (cinfo->streams == NULL)
+  {
+    lprintf (0, "[%s] Error creating stream tracking binary tree", cinfo->hostname);
+    setuperr = 1;
+  }
+
+  /* Allocate client specific send buffer.
+   * 64 × pktsize gives the TCP stack a large coalescing window so that
+   * many SeedLink records can be handed off in a single writev/send call,
+   * dramatically reducing per-packet syscall overhead at high client counts. */
+  cinfo->sendbufsize = 64 * param.pktsize;
+  cinfo->sendbuf     = (char *)malloc (cinfo->sendbufsize);
+  if (!cinfo->sendbuf)
+  {
+    lprintf (0, "[%s] Error allocating send buffer", cinfo->hostname);
+    setuperr = 1;
+  }
+
+  /* Allocate client specific receive buffer */
+  cinfo->recvbufsize = 10 * param.pktsize;
+  cinfo->recvbuf     = (char *)malloc (cinfo->recvbufsize);
+  if (!cinfo->recvbuf)
+  {
+    lprintf (0, "[%s] Error allocating receive buffer", cinfo->hostname);
+    setuperr = 1;
+  }
+
+  /* Set client socket connection to non-blocking */
+  sockflags = fcntl (cinfo->socket, F_GETFL, 0);
+  sockflags |= O_NONBLOCK;
+  if (fcntl (cinfo->socket, F_SETFL, sockflags) == -1)
+  {
+    lprintf (0, "[%s] Error setting non-blocking flag: %s", cinfo->hostname, strerror (errno));
+    setuperr = 1;
+  }
+
+  /* Apply allowed sources if specified */
+  if (cinfo->allowedstr)
+  {
+    if (RingAllowed (&reader, cinfo->allowedstr) < 0)
+    {
+      lprintf (0, "[%s] Error with RingAllowed for '%s'", cinfo->hostname, cinfo->allowedstr);
+      setuperr = 1;
+    }
+  }
+
+  /* Apply forbidden sources if specified */
+  if (cinfo->forbiddenstr)
+  {
+    if (RingForbidden (&reader, cinfo->forbiddenstr) < 0)
+    {
+      lprintf (0, "[%s] Error with RingForbidden for '%s'", cinfo->hostname, cinfo->forbiddenstr);
+      setuperr = 1;
+    }
+  }
+
+  if (cinfo->tls && TLSConfigure (cinfo))
+  {
+    lprintf (0, "[%s] Error negotiating TLS", cinfo->hostname);
+    setuperr = 1;
+  }
+
+  /* Shutdown the client connection if there were setup errors */
+  if (setuperr)
+  {
+    /* Set thread closing status under lock so outside readers see the
+       transition out of TDS_ACTIVE before ClientInfo is freed */
+    pthread_mutex_lock (&param.cthreads_lock);
+    mytdp->td_state = TDS_CLOSING;
+    pthread_mutex_unlock (&param.cthreads_lock);
+
+    /* Close client socket */
+    if (cinfo->socket != -1)
+    {
+      shutdown (cinfo->socket, SHUT_RDWR);
+      close (cinfo->socket);
+      cinfo->socket = -1;
+    }
+
+    TLSCleanup (cinfo);
+
+    /* Release allowed and forbidden related PCRE2 data */
+    free (cinfo->allowedstr);
+    if (cinfo->reader->allowed)
+      pcre2_code_free (cinfo->reader->allowed);
+    if (cinfo->reader->allowed_data)
+      pcre2_match_data_free (cinfo->reader->allowed_data);
+    free (cinfo->forbiddenstr);
+    if (cinfo->reader->forbidden)
+      pcre2_code_free (cinfo->reader->forbidden);
+    if (cinfo->reader->forbidden_data)
+      pcre2_match_data_free (cinfo->reader->forbidden_data);
+
+    cinfo->reader = NULL;
+
+    /* Release stream tracking binary tree */
+    pthread_mutex_lock (&(cinfo->streams_lock));
+    RBTreeDestroy (cinfo->streams);
+    cinfo->streams      = NULL;
+    cinfo->streamscount = 0;
+    pthread_mutex_unlock (&(cinfo->streams_lock));
+
+    free (cinfo->sendbuf);
+    free (cinfo->recvbuf);
+    free (cinfo->convertbuf);
+    free (cinfo->addr);
+    cinfo->addr = NULL;
+    free (cinfo->mswrite);
+
+    lprintf (1, "Client setup error, disconnected: %s", cinfo->hostname);
+
+    /* Publish TDS_CLOSED under lock so the reaper sees all cleanup writes
+       before it joins this thread */
+    pthread_mutex_lock (&param.cthreads_lock);
+    mytdp->td_state = TDS_CLOSED;
+    pthread_mutex_unlock (&param.cthreads_lock);
+
+    return NULL;
+  }
+
+  /* If only one protocol is enabled set the expected client type */
+  if (cinfo->protocols == PROTO_DATALINK)
+    cinfo->type = CLIENT_DATALINK;
+  else if (cinfo->protocols == PROTO_SEEDLINK)
+    cinfo->type = CLIENT_SEEDLINK;
+  else if (cinfo->protocols == PROTO_HTTP)
+    cinfo->type = CLIENT_HTTP;
+
+  /* Set thread active status */
+  if (mytdp->td_state == TDS_SPAWNING)
+    mytdp->td_state = TDS_ACTIVE;
+
+  /* Main client loop, delegating processing and data flow */
+  while (mytdp->td_state != TDS_CLOSE)
+  {
+    /* Increment throttle if not at maximum */
+    if (throttle_msec < THROTTLE_MAXIMUM)
+      throttle_msec += THROTTLE_STEPPING;
+
+    /* Recv data from client */
+    nread = ClientRecv (cinfo);
+
+    /* Error receiving data, -1 = orderly shutdown, -2 = error */
+    if (nread < 0)
+    {
+      break;
+    }
+
+    /* Data received from client */
+    if (nread > 0)
+    {
+      int cmd_result = 0;
+
+      /* If data was received do not throttle */
+      throttle_msec = 0;
+
+      /* Reset incomplete recv timer, a complete command was received */
+      cinfo->recvstart = 0;
+
+      /* Handle data from client according to client type */
+      if (cinfo->type == CLIENT_DATALINK)
+      {
+        cmd_result = DLHandleCmd (cinfo);
+      }
+      else if (cinfo->type == CLIENT_HTTP)
+      {
+        /* HTTP handler: non-zero always means disconnect */
+        if (HandleHTTP (cinfo->recvbuf, cinfo))
+        {
+          break;
+        }
+      }
+      else
+      {
+        cmd_result = SLHandleCmd (cinfo);
+      }
+
+      /* Fatal error from command handler */
+      if (cmd_result < 0)
+      {
+        break;
+      }
+
+      /* Client error (e.g. unrecognized command), track consecutive errors */
+      if (cmd_result > 0)
+      {
+        consecutive_errors++;
+        if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS)
+        {
+          lprintf (0, "[%s] Too many consecutive errors (%d), disconnecting",
+                   cinfo->hostname, consecutive_errors);
+          break;
+        }
+      }
+      else
+      {
+        consecutive_errors = 0;
+      }
+    } /* Done handling data from client */
+
+    /* Regular, outbound data flow */
+    if (cinfo->state == STATE_STREAM)
+    {
+      sentbytes = 0;
+
+      if (cinfo->type == CLIENT_DATALINK)
+      {
+        sentbytes = DLStreamPackets (cinfo);
+      }
+      else if (cinfo->type == CLIENT_SEEDLINK)
+      {
+        sentbytes = SLStreamPackets (cinfo);
+      }
+
+      if (sentbytes < 0) /* Bail on error */
+      {
+        break;
+      }
+      if (sentbytes == 0) /* No packet sent, maximum throttle immediately */
+      {
+        throttle_msec = THROTTLE_MAXIMUM;
+      }
+      else /* If packet sent do not throttle */
+      {
+        throttle_msec = 0;
+      }
+    } /* Done with data streaming */
+
+    /* Throttle loop and check for idle connections */
+    if (throttle_msec > 0)
+    {
+      /* Check for connections with no communication and drop if idle
+         for more than 10 seconds */
+      if (throttle_msec >= THROTTLE_MAXIMUM &&
+          cinfo->lastxchange == cinfo->conntime &&
+          (NSnow () - cinfo->conntime) > ((nstime_t)NSTMODULUS * 10))
+      {
+        lprintf (0, "[%s] Non-communicating client timeout",
+                 cinfo->hostname);
+        break;
+      }
+
+      /* Check for stalled incomplete command reception (slow-loris protection).
+         If data appeared in the buffer but a complete command has not been
+         received within the network I/O timeout, disconnect the client. */
+      if (cinfo->recvstart != 0 &&
+          (NSnow () - cinfo->recvstart) > ((nstime_t)NSTMODULUS * config.netiotimeout))
+      {
+        lprintf (0, "[%s] Timeout for incomplete command reception",
+                 cinfo->hostname);
+        break;
+      }
+
+      /* For known connection types throttle the loop until data is available */
+      if (cinfo->type != CLIENT_UNDETERMINED)
+      {
+        PollSocket (cinfo->socket, 1, 0, throttle_msec);
+      }
+      /* For unknown (undetermined) connection types throttle the loop
+         using nanosleep() as one or two bytes may be available but not
+         enough to determine the type. */
+      else
+      {
+        timereq.tv_sec  = throttle_msec / 1000;
+        timereq.tv_nsec = (throttle_msec % 1000) * 1000000;
+
+        nanosleep (&timereq, NULL);
+      }
+    }
+  } /* End of main client loop */
+
+  /* Set thread CLOSING status, locking entire client list */
+  pthread_mutex_lock (&param.cthreads_lock);
+  mytdp->td_state = TDS_CLOSING;
+  pthread_mutex_unlock (&param.cthreads_lock);
+
+  /* Close client socket */
+  if (cinfo->socket != -1)
+  {
+    /* Send websocket Close frame if not already sent */
+    if (cinfo->websocket == 1)
+    {
+      /* 0: Opcode 0x8 plus the FIN bit (0x88), 1: length 2, 2-3: value 1000 (Normal Closure) */
+      uint8_t closeframe[4] = {0x88, 0x02, 0x03, 0xE8};
+      SendData (cinfo, closeframe, 4, 1);
+
+      /* Wait up to 1 second for a response and and consume */
+      if (PollSocket (cinfo->socket, 1, 0, 1000) > 0)
+      {
+        uint64_t length;
+        RecvWSFrame (cinfo, &length);
+      }
+
+      cinfo->websocket = 2; /* Indicate a close frame has been sent */
+    }
+
+    shutdown (cinfo->socket, SHUT_RDWR);
+    close (cinfo->socket);
+    cinfo->socket = -1;
+  }
+
+  TLSCleanup (cinfo);
+
+  /* Write out transmission log for this client if requested */
+  if (config.usagelog.mode & (USAGELOG_TX | USAGELOG_RX))
+  {
+    lprintf (2, "[%s] Writing transmission log", cinfo->hostname);
+    WriteTransferLog (cinfo, 1);
+  }
+
+  /* Release allowed and forbidden pattern strings and related PCRE2 data */
+  free (cinfo->allowedstr);
+  if (cinfo->reader->allowed)
+    pcre2_code_free (cinfo->reader->allowed);
+  if (cinfo->reader->allowed_data)
+    pcre2_match_data_free (cinfo->reader->allowed_data);
+  free (cinfo->forbiddenstr);
+  if (cinfo->reader->forbidden)
+    pcre2_code_free (cinfo->reader->forbidden);
+  if (cinfo->reader->forbidden_data)
+    pcre2_match_data_free (cinfo->reader->forbidden_data);
+
+  /* Release match and reject pattern strings and related PCRE2 data */
+  free (cinfo->matchstr);
+  if (cinfo->reader->match)
+    pcre2_code_free (cinfo->reader->match);
+  if (cinfo->reader->match_data)
+    pcre2_match_data_free (cinfo->reader->match_data);
+  free (cinfo->rejectstr);
+  if (cinfo->reader->reject)
+    pcre2_code_free (cinfo->reader->reject);
+  if (cinfo->reader->reject_data)
+    pcre2_match_data_free (cinfo->reader->reject_data);
+
+  cinfo->reader = NULL;
+
+  /* Release stream tracking binary tree */
+  pthread_mutex_lock (&(cinfo->streams_lock));
+  RBTreeDestroy (cinfo->streams);
+  cinfo->streams      = NULL;
+  cinfo->streamscount = 0;
+  pthread_mutex_unlock (&(cinfo->streams_lock));
+
+  /* Release the client send, receive and conversion buffers */
+  free (cinfo->sendbuf);
+  free (cinfo->recvbuf);
+  free (cinfo->convertbuf);
+
+  /* Release client socket structure, allocated in ListenThread() */
+  free (cinfo->addr);
+  cinfo->addr = NULL;
+
+  /* Shutdown and release miniSEED write data stream */
+  if (cinfo->mswrite)
+  {
+    ds_streamproc (cinfo->mswrite, NULL, cinfo->hostname);
+    free (cinfo->mswrite);
+    cinfo->mswrite = NULL;
+  }
+
+  if (cinfo->type == CLIENT_SEEDLINK && cinfo->extinfo)
+    SLFree (cinfo);
+
+  if (cinfo->type == CLIENT_DATALINK && cinfo->extinfo)
+    DLFree (cinfo);
+
+  WriteAccessLog (cinfo, "disconnect", NULL, NULL, NULL, NULL);
+
+  lprintf (1, "Client disconnected: %s", cinfo->hostname);
+
+  /* Publish TDS_CLOSED under lock so the reaper sees all cleanup writes
+     before it joins this thread */
+  pthread_mutex_lock (&param.cthreads_lock);
+  mytdp->td_state = TDS_CLOSED;
+  pthread_mutex_unlock (&param.cthreads_lock);
+
+  return NULL;
+} /* End of ClientThread() */
+
+/***********************************************************************
+ * ClientRecv:
+ *
+ * Recv command in manner specific to the protocol.  If the protocol
+ * is undetermined, autodetect from the initial bytes received.
+ *
+ * If the connection is WebSocket, receive a WebSocket frame and unmask
+ * the payload.
+ *
+ * Return >0 as number of bytes read on success
+ * Return  0 when no data is available
+ * Return -1 on error or timeout, ClientInfo.socketerr might be set
+ * Return -2 on orderly shutdown, ClientInfo.socketerr is set
+ ***********************************************************************/
+static int
+ClientRecv (ClientInfo *cinfo)
+{
+  int nread = 0;
+
+  if (!cinfo)
+    return -1;
+
+  /* Determine client type from initial 3 bytes of data */
+  if (cinfo->type == CLIENT_UNDETERMINED)
+  {
+    /* Recv data from client, but do not consume */
+    nread = RecvData (cinfo, NULL, 3, 0);
+
+    if (nread <= 0)
+    {
+      return nread;
+    }
+    else
+    {
+      /* Un-consume peeked data so it can be processed by protocol handler */
+      if (cinfo->recvconsumed >= (size_t)nread)
+        cinfo->recvconsumed -= nread;
+      else
+        cinfo->recvconsumed = 0;
+    }
+
+    /* Ensure sufficient data is available for detection */
+    if (cinfo->recvlength < 3)
+    {
+      return 0;
+    }
+
+    /* DataLink commands start with 'DL' */
+    if (cinfo->protocols & PROTO_DATALINK &&
+        cinfo->recvbuf[0] == 'D' &&
+        cinfo->recvbuf[1] == 'L')
+    {
+      cinfo->type = CLIENT_DATALINK;
+    }
+    /* HTTP requests start with known method */
+    else if (cinfo->protocols & PROTO_HTTP &&
+             HTTPMETHOD (cinfo->recvbuf))
+    {
+      cinfo->type = CLIENT_HTTP;
+    }
+    /* PROXY protocol v2 signature starts with \r\n\r, which cannot be the
+     * start of any legitimate DataLink, SeedLink, or HTTP command.
+     * On a PROXYv2 port the header is consumed at accept time; seeing it
+     * here means an unexpected additional header.  On other ports, reject it. */
+    else if ((uint8_t)cinfo->recvbuf[0] == 0x0D &&
+             (uint8_t)cinfo->recvbuf[1] == 0x0A &&
+             (uint8_t)cinfo->recvbuf[2] == 0x0D)
+    {
+      if (cinfo->proxyv2)
+        lprintf (0, "[%s] Unexpected additional PROXY protocol v2 header on port %s, disconnecting",
+                 cinfo->hostname, cinfo->listenerport);
+      else
+        lprintf (0, "[%s] Received PROXY protocol v2 header on port %s not configured for PROXYv2, disconnecting",
+                 cinfo->hostname, cinfo->listenerport);
+      return -1;
+    }
+    /* Everything else is SeedLink if allowed on this listener */
+    else if (cinfo->protocols & PROTO_SEEDLINK)
+    {
+      cinfo->type = CLIENT_SEEDLINK;
+    }
+    else
+    {
+      lprintf (0, "[%s] Cannot determine allowed client protocol from '%c%c%c'",
+               cinfo->hostname,
+               (cinfo->recvbuf[0] < 32 || cinfo->recvbuf[0] > 126) ? '?' : cinfo->recvbuf[0],
+               (cinfo->recvbuf[1] < 32 || cinfo->recvbuf[1] > 126) ? '?' : cinfo->recvbuf[1],
+               (cinfo->recvbuf[2] < 32 || cinfo->recvbuf[2] > 126) ? '?' : cinfo->recvbuf[2]);
+      return -1;
+    }
+  }
+
+  /* Recv a WebSocket frame if this connection is WebSocket */
+  if (cinfo->websocket)
+  {
+    uint64_t payload_length = 0;
+
+    /* Recv a frame header and determine payload length */
+    nread = RecvWSFrame (cinfo, &payload_length);
+
+    if (nread < 0)
+    {
+      return nread;
+    }
+    else if (nread == 0)
+    {
+      return 0;
+    }
+    else if (payload_length > 0)
+    {
+      if (payload_length > cinfo->recvbufsize)
+      {
+        lprintf (0, "[%s] WebSocket payload length %" PRIu64 " exceeds receive buffer size",
+                 cinfo->hostname, payload_length);
+        return -1;
+      }
+
+      /* Receive the frame payload */
+      nread = RecvData (cinfo, cinfo->recvbuf, (size_t)payload_length, 1);
+
+      /* Unmask WebSocket payload */
+      if (cinfo->recvlength >= payload_length)
+      {
+        char *recvptr = cinfo->recvbuf;
+
+        for (size_t idx = 0; idx < payload_length; idx++, recvptr++, cinfo->wsmaskidx++)
+          *recvptr = *recvptr ^ cinfo->wsmask.four[cinfo->wsmaskidx % 4];
+
+        /* Un-consume the unmasked payload so it can be processed */
+        if (cinfo->recvconsumed >= payload_length)
+          cinfo->recvconsumed -= payload_length;
+        else
+          cinfo->recvconsumed = 0;
+      }
+      else
+      {
+        lprintf (0, "[%s] Error receiving WebSocket payload of %" PRIu64 " bytes\n",
+                 cinfo->hostname, payload_length);
+        return -1;
+      }
+    }
+  }
+
+  /* Recv command from client */
+  if (cinfo->type == CLIENT_DATALINK)
+  {
+    nread = RecvDLCommand (cinfo);
+  }
+  else if (cinfo->type == CLIENT_SEEDLINK)
+  {
+    nread = RecvLine (cinfo);
+  }
+  else if (cinfo->type == CLIENT_HTTP)
+  {
+    nread = RecvLine (cinfo);
+  }
+  else
+  {
+    lprintf (0, "[%s] Unknown client type, cannot receive data",
+             cinfo->hostname);
+    return -1;
+  }
+
+  return nread;
+} /* End of ClientRecv() */
+
+/***************************************************************************
+ * SendData:
+ *
+ * Send 'buflen' bytes from 'buffer' to 'cinfo->socket'.
+ * A thin wrapper to call SendDataMB() with a single buffer.
+ *
+ * Returns the return value of SendDataMB().
+ ***************************************************************************/
+int
+SendData (ClientInfo *cinfo, void *buffer, size_t buflen, int no_wsframe)
+{
+  return SendDataMB (cinfo, &buffer, &buflen, 1, no_wsframe);
+} /* End of SendData() */
+
+/***************************************************************************
+ * SendDataMB:  Multi-buffer send
+ *
+ * Send all buffers to 'cinfo->socket' in order.
+ *
+ * If connection is a WebSocket, and no_wsframe is not set, create a single
+ * frame header that represents the total of all buffers.
+ *
+ * Sending will be attempted until the network I/O timeout is reached.
+ *
+ * Return  0 on success
+ * Return -1 on error or timeout, ClientInfo.socketerr is set
+ * Return -2 on orderly shutdown, ClientInfo.socketerr is set
+ ***************************************************************************/
+int
+SendDataMB (ClientInfo *cinfo, void *buffer[], size_t buflen[],
+            int bufcount, int no_wsframe)
+{
+  TLSCTX *tlsctx     = cinfo->tlsctx;
+  size_t totalbuflen = 0;
+  int written;
+  int pollret;
+  int nsent;
+  int idx;
+
+  uint8_t wsframe[10];
+  size_t wsframelen;
+
+#define MAX_REPLACEMENT_LIST_LENGTH 10
+  void *new_buffer[MAX_REPLACEMENT_LIST_LENGTH];
+  size_t new_buflen[MAX_REPLACEMENT_LIST_LENGTH];
+
+  if (!cinfo)
+    return -1;
+
+  if (bufcount <= 0)
+    return 0;
+
+  for (idx = 0; idx < bufcount; idx++)
+  {
+    totalbuflen += buflen[idx];
+  }
+
+  /* If connection is WebSocket, generate and send an appropriate frame */
+  if (cinfo->websocket && !no_wsframe)
+  {
+    wsframelen = 0;
+    wsframe[0] = 0x82; /* FIN=1(0x80), OPCODE=binary(0x2) */
+    wsframe[1] = 0;    /* MASK=0, payload length added below */
+
+    if (totalbuflen < 126) /* If payload length < 126 store in bits 1-7 of byte 2 */
+    {
+      wsframelen = 2;
+      wsframe[1] |= (uint8_t)totalbuflen;
+    }
+    else if (totalbuflen <= UINT16_MAX) /* If payload length fits in 16 bits store in next two bytes */
+    {
+      wsframelen = 4;
+      wsframe[1] |= 126;
+      uint16_t length16 = totalbuflen;
+      if (!ms_bigendianhost ())
+        ms_gswap2 (&length16);
+      memcpy (&wsframe[2], &length16, 2);
+    }
+    else if (totalbuflen < UINT64_MAX) /* If payload length < 64-bit int store in next 8 bytes */
+    {
+      wsframelen = 10;
+      wsframe[1] |= 127;
+      uint64_t length64 = totalbuflen;
+      if (!ms_bigendianhost ())
+        ms_gswap8 (&length64);
+      memcpy (&wsframe[2], &length64, 8);
+    }
+    else
+    {
+      lprintf (0, "[%s] %s() Payload length too large for WebSocket: %zu",
+               cinfo->hostname, __func__, totalbuflen);
+      return -1;
+    }
+
+    /* Protection in case future use case uses more buffers than our stack replacements */
+    if (bufcount >= MAX_REPLACEMENT_LIST_LENGTH)
+    {
+      lprintf (0, "[%s] %s() Too many buffers for WebSocket frame: %d",
+               cinfo->hostname, __func__, bufcount);
+      return -1;
+    }
+
+    /* Add WebSocket frame header to buffer and buflen lists */
+    new_buffer[0] = wsframe;
+    new_buflen[0] = wsframelen;
+
+    memcpy (new_buffer + 1, buffer, bufcount * sizeof (void *));
+    memcpy (new_buflen + 1, buflen, bufcount * sizeof (size_t));
+
+    buffer = new_buffer;
+    buflen = new_buflen;
+    bufcount++;
+  }
+
+  /* Send each buffer in sequence */
+  for (idx = 0; idx < bufcount; idx++)
+  {
+    /* Loop until entire buffer has been sent, polling socket as needed */
+    for (written = 0, nsent = 0;
+         written < buflen[idx] && nsent >= 0;
+         written += nsent)
+    {
+      if (cinfo->tlsctx)
+      {
+        while ((nsent = mbedtls_ssl_write (&tlsctx->ssl, (unsigned char *)buffer[idx] + written, buflen[idx] - written)) <= 0)
+        {
+          pollret = 1;
+          if (nsent == MBEDTLS_ERR_SSL_WANT_READ)
+            pollret = PollSocket (cinfo->socket, 1, 0, config.netiotimeout * 1000);
+          else if (nsent == MBEDTLS_ERR_SSL_WANT_WRITE)
+            pollret = PollSocket (cinfo->socket, 0, 1, config.netiotimeout * 1000);
+          else
+            break;
+
+          if (pollret == 0)
+          {
+            if (param.shutdownsig == 0)
+            {
+              lprintf (0, "[%s] Timeout sending data", cinfo->hostname);
+              cinfo->socketerr = -1;
+              return -1;
+            }
+            else /* Indicate an orderly shutdown */
+            {
+              cinfo->socketerr = -2;
+              return -2;
+            }
+          }
+          else if (pollret == -1 && errno != EINTR)
+          {
+            lprintf (0, "[%s] Error polling socket", cinfo->hostname);
+            cinfo->socketerr = -1;
+            return -1;
+          }
+        }
+      }
+      else
+      {
+        while ((nsent = send (cinfo->socket, (unsigned char *)buffer[idx] + written, buflen[idx] - written, 0)) <= 0)
+        {
+          pollret = 1;
+          if (nsent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            pollret = PollSocket (cinfo->socket, 0, 1, config.netiotimeout * 1000);
+          else if (nsent < 0)
+            break;
+          else if (nsent == 0)
+            break; /* No progress, avoid infinite loop */
+
+          if (pollret == 0)
+          {
+            if (param.shutdownsig == 0)
+            {
+              lprintf (0, "[%s] Timeout sending data", cinfo->hostname);
+              cinfo->socketerr = -1;
+              return -1;
+            }
+            else /* Indicate an orderly shutdown */
+            {
+              cinfo->socketerr = -2;
+              return -2;
+            }
+          }
+          else if (pollret == -1 && errno != EINTR)
+          {
+            lprintf (0, "[%s] Error polling socket", cinfo->hostname);
+            cinfo->socketerr = -1;
+            return -1;
+          }
+        }
+      }
+    }
+
+    /* Connection closed by peer */
+    if ((cinfo->tlsctx && nsent == MBEDTLS_ERR_NET_CONN_RESET) ||
+        (nsent == -1 && errno == EPIPE))
+    {
+      cinfo->socketerr = -2; /* Indicate an orderly shutdown */
+      return -2;
+    }
+    /* send() returned 0 (no progress), treat as error */
+    else if (nsent == 0)
+    {
+      lprintf (0, "[%s] Error sending data: send returned 0", cinfo->hostname);
+      cinfo->socketerr = -1;
+      return -1;
+    }
+    /* Connection error */
+    else if (nsent < 0)
+    {
+      /* Create a limited, printable buffer for the diagnostic message */
+      char pbuffer[100];
+      char *cp;
+      size_t copylen = (buflen[idx] < sizeof (pbuffer) - 1) ? buflen[idx] : sizeof (pbuffer) - 1;
+
+      memcpy (pbuffer, buffer[idx], copylen);
+      pbuffer[copylen] = '\0';
+
+      if ((cp = memchr (pbuffer, '\r', copylen)))
+        *cp = '\0';
+
+      if ((cp = memchr (pbuffer, '\n', copylen)))
+        *cp = '\0';
+
+      /* Replace unprintable characters with '?' */
+      for (cp = pbuffer; *cp != '\0'; cp++)
+      {
+        if (*cp < 32 || *cp > 126)
+          *cp = '?';
+      }
+
+      lprintf (0, "[%s] Error sending data: '%s'", cinfo->hostname, pbuffer);
+      cinfo->socketerr = -1; /* Indicate fatal socket error */
+      return -1;
+    }
+  } /* Done looping through supplied buffers */
+
+  /* Update the time of the last packet exchange */
+  cinfo->lastxchange = NSnow ();
+
+  return 0;
+} /* End of SendDataMB() */
+
+/***********************************************************************
+ * RecvData:
+ *
+ * Read recvlen bytes from a socket and place in the specified buffer.
+ * The CLentInfo.recvbuf buffer is used to store the received data.
+ * If the destination buffer is _not_ ClientInfo.recvbuf then the
+ * data is copied to the destination buffer after being received.
+ *
+ * This routine handles fragmented receives, meaning that it will
+ * continue to receive data until recvlen bytes have been received
+ * with the exceptions noted below.
+ *
+ * This routine will _not_ return partial requests, either they are
+ * fulfilled, unavailable (return of 0) or an error occurs.
+ *
+ * If fulfill is false (0) this routine will return immediately if
+ * no data is available on the first read.  But, if some data are
+ * read during the first read this routine will block until recvlen
+ * bytes have been read.
+ *
+ * If fulfill is true (non-0) this routine will block until
+ * recvlen bytes have been read.
+ *
+ * For any blocking reads this routine will poll the socket for up to
+ * the configured network I/O timeout (in seconds) returning -2.
+ *
+ * The caller should consume the number of bytes requested and returned
+ * or it will be discarded on the next call.  Alternatively, the caller
+ * should set ClientInfo.recvconsumed to the number of bytes consumed,
+ * if any.
+ *
+ * Return >0 as number of bytes for the caller to consume on success
+ * Return  0 when fulfill == 0 and no data is available
+ * Return -1 on error or timeout, ClientInfo.socketerr may be set
+ * Return -2 on orderly shutdown, ClientInfo.socketerr is set
+ ***********************************************************************/
+int
+RecvData (ClientInfo *cinfo, void *buffer, size_t requested, int fulfill)
+{
+  TLSCTX *tlsctx = cinfo->tlsctx;
+  ssize_t nrecv;
+  size_t nread = 0;
+  size_t receivable;
+  char *recvptr;
+  char peekbyte[1];
+
+  if (!cinfo)
+  {
+    return -1;
+  }
+
+  /* Check if socket has been disconnected, but only if there is no
+   * buffered data remaining to process.  TLS connections cannot be checked. */
+  if (!cinfo->tlsctx && cinfo->recvlength <= cinfo->recvconsumed)
+  {
+    if (recv (cinfo->socket, peekbyte, 1, MSG_PEEK) == 0)
+    {
+      cinfo->socketerr = -2;
+      return -2;
+    }
+  }
+
+  if (requested > cinfo->recvbufsize)
+  {
+    lprintf (0, "[%s] %s(): Requested receive length exceeds buffer size",
+             cinfo->hostname, __func__);
+    cinfo->socketerr = -1;
+    return -1;
+  }
+
+  /* Shift previously consumed bytes from receive buffer */
+  if (cinfo->recvconsumed > 0)
+  {
+    if (cinfo->recvconsumed < cinfo->recvlength)
+    {
+      memmove (cinfo->recvbuf,
+               cinfo->recvbuf + cinfo->recvconsumed,
+               cinfo->recvlength - cinfo->recvconsumed);
+
+      cinfo->recvlength -= cinfo->recvconsumed;
+    }
+    else
+    {
+      cinfo->recvlength = 0;
+    }
+
+    cinfo->recvconsumed = 0;
+  }
+
+  recvptr    = cinfo->recvbuf + cinfo->recvlength;
+  receivable = cinfo->recvbufsize - cinfo->recvlength;
+
+  /* Deadline for total receive time, to prevent slow trickle attacks.
+   * Only meaningful when netiotimeout > 0 (i.e. not during shutdown). */
+  nstime_t recv_deadline = NSnow () + (nstime_t)NSTMODULUS * config.netiotimeout * 2;
+
+  while ((cinfo->recvlength + nread) < requested)
+  {
+    if (cinfo->tlsctx)
+    {
+      nrecv = mbedtls_ssl_read (&tlsctx->ssl, (unsigned char *)recvptr, receivable - nread);
+    }
+    else
+    {
+      nrecv = recv (cinfo->socket, recvptr, receivable - nread, 0);
+    }
+
+    /* Poll/throttle efficiently when there is no data on a non-blocking connection
+     * TLS connections: return values of MBEDTLS_ERR_SSL_WANT_READ and MBEDTLS_ERR_SSL_WANT_WRITE
+     * non-TLS connections: nrecv == -1 and errno is EAGAIN or EWOULDBLOCK */
+    if ((cinfo->tlsctx &&
+         (nrecv == MBEDTLS_ERR_SSL_WANT_READ || nrecv == MBEDTLS_ERR_SSL_WANT_WRITE)) ||
+        (nrecv == -1 &&
+         (errno == EAGAIN || errno == EWOULDBLOCK)))
+    {
+      /* Return immediately if no data is available and no data has been read yet */
+      if (fulfill == 0 && nread == 0)
+        return 0;
+
+      /* Check total elapsed time to prevent slow trickle attacks.
+       * Skip this check during shutdown (netiotimeout == 0) to avoid
+       * a misleading "slow trickle protection" log message. */
+      if (param.shutdownsig == 0 && NSnow () > recv_deadline)
+      {
+        lprintf (0, "[%s] Total receive deadline exceeded (slow trickle protection)", cinfo->hostname);
+        cinfo->socketerr = -1;
+        return -1;
+      }
+
+      /* Poll up to socket timeout value (in seconds) */
+      int pollret = PollSocket (cinfo->socket, 1, 0, config.netiotimeout * 1000);
+
+      if (pollret == 0)
+      {
+        if (param.shutdownsig == 0)
+        {
+          lprintf (0, "[%s] Timeout receiving data", cinfo->hostname);
+          cinfo->socketerr = -1;
+          return -1;
+        }
+        else
+        {
+          cinfo->socketerr = -2;
+          return -2;
+        }
+      }
+      else if (pollret == -1 && errno != EINTR)
+      {
+        lprintf (0, "[%s] Error polling socket", cinfo->hostname);
+        cinfo->socketerr = -1;
+        return -1;
+      }
+    }
+
+    /* Connection closed by peer */
+    else if (nrecv == 0 ||
+             (cinfo->tlsctx &&
+              (nrecv == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY ||
+               nrecv == MBEDTLS_ERR_NET_CONN_RESET)))
+    {
+      cinfo->socketerr = -2; /* Indicate an orderly shutdown */
+      return -2;
+    }
+
+    /* Connection error */
+    else if (nrecv < 0)
+    {
+      if (cinfo->tlsctx)
+      {
+        char errbuf[128];
+        mbedtls_strerror ((int)nrecv, errbuf, sizeof (errbuf));
+        lprintf (0, "[%s] Error receiving data from client: %s",
+                 cinfo->hostname, errbuf);
+      }
+      else
+      {
+        lprintf (0, "[%s] Error receiving data from client: %s",
+                 cinfo->hostname, strerror (errno));
+      }
+      cinfo->socketerr = -1; /* Indicate fatal socket error */
+      return -1;
+    }
+
+    /* Update recv pointer and received byte counts */
+    else if (nrecv > 0)
+    {
+      recvptr += nrecv;
+      nread += (size_t)nrecv;
+    }
+  }
+
+  if (nread > 0)
+  {
+    cinfo->recvlength += nread;
+
+    /* Update the time of the last packet exchange */
+    cinfo->lastxchange = NSnow ();
+
+    /* Record when incomplete data first appeared in the buffer */
+    if (cinfo->recvstart == 0)
+      cinfo->recvstart = cinfo->lastxchange;
+  }
+
+  /* Copy data to supplied buffer if not the receive buffer */
+  if (buffer && buffer != cinfo->recvbuf)
+  {
+    memcpy (buffer, cinfo->recvbuf, requested);
+  }
+
+  /* The caller _must_ consume the data requested */
+  cinfo->recvconsumed = requested;
+
+  return requested;
+} /* End of RecvData() */
+
+/***********************************************************************
+ * RecvDLCommand:
+ *
+ * Read a command from the client socket as a header-only DataLink
+ * packet.  A header-only DataLink packet is composed of a pre-header
+ * followed by a header body.  The pre-header is composed of 3 bytes:
+ * the two ASCII characters 'DL' followed by an unsigned 8-bit integer
+ * indicating the size of the header body.
+ *
+ * This routine handles fragmented receives after some data has been
+ * read.  If no data has been read and no data is available from the
+ * socket this routine will return immediately.
+ *
+ * The command (header body) returned in the ClientInfo.recvbuf buffer
+ * will always be a NULL terminated string.
+ *
+ * Return >0 as number of bytes read on success
+ * Return  0 when no data is available
+ * Return -1 on error or timeout, ClientInfo.socketerr is set
+ * Return -2 on orderly shutdown, ClientInfo.socketerr is set
+ ***********************************************************************/
+int
+RecvDLCommand (ClientInfo *cinfo)
+{
+  int nread = 0;
+  int nrecv;
+  uint8_t headerlen;
+
+  if (!cinfo)
+    return -1;
+
+  if (!cinfo->recvbuf)
+  {
+    cinfo->socketerr = -1;
+    return -1;
+  }
+
+  /* Receive and process the 3 byte DataLink pre-header */
+  nrecv = RecvData (cinfo, cinfo->recvbuf, 3, 0);
+
+  if (nrecv != 3)
+  {
+    return nrecv;
+  }
+
+  nread += nrecv;
+
+  /* Sequence bytes of 'DL' identify DataLink */
+  if (cinfo->recvbuf[0] == 'D' && cinfo->recvbuf[1] == 'L')
+  {
+    /* Determine length of header body */
+    headerlen = (uint8_t)(cinfo->recvbuf[2]);
+  }
+  else
+  {
+    lprintf (2, "[%s] Error verifying DataLink sequence bytes (%c%c)",
+             cinfo->hostname, *(cinfo->recvbuf), *(cinfo->recvbuf + 1));
+    cinfo->socketerr = -1;
+    return -1;
+  }
+
+  /* Sanity check the header size */
+  if (headerlen < 2)
+  {
+    lprintf (0, "[%s] Pre-header indicates a header size too small: %u",
+             cinfo->hostname, headerlen);
+    cinfo->socketerr = -1;
+    return -1;
+  }
+
+  /* Receive command in header body, must be fulfilled */
+  nrecv = RecvData (cinfo, cinfo->dlcommand, headerlen, 1);
+
+  if (nrecv != headerlen)
+  {
+    return nrecv;
+  }
+
+  nread += nrecv;
+
+  /* Make sure the command is NULL terminated. The command buffer size is the
+   * the maximum header length (UINT8_MAX) plus 1, so this should be safe. */
+  cinfo->dlcommand[nrecv] = '\0';
+
+  return nread;
+} /* End of RecvDLCommand() */
+
+/***********************************************************************
+ * RecvLine:
+ *
+ * Check the receive buffer for lines terminated by '\r' (carriage return),
+ * '\n' (newline), or both adjacent are found.
+ *
+ * The resulting line will be left in the receive buffer and will always
+ * be NULL terminated.
+ *
+ * If no data has been read and no data is available from the socket
+ * this routine will return immediately.
+ *
+ * Return >0 as number of bytes in line on success
+ * Return  0 when no line is available
+ * Return -1 on error or timeout, ClientInfo.socketerr is set
+ * Return -2 on orderly shutdown, ClientInfo.socketerr is set
+ ***********************************************************************/
+int
+RecvLine (ClientInfo *cinfo)
+{
+  size_t skipped = 0;
+  int nread      = 0;
+
+  if (!cinfo)
+    return -1;
+
+  if (!cinfo->recvbuf)
+  {
+    cinfo->socketerr = -1;
+    return -1;
+  }
+
+  /* This routine must search for a variable number of terminators in
+   * received data.  The strategy to do this is as follows:
+   *
+   * Request a single byte using RecvData() and then directly search
+   * for terminators in all available data in the receive buffer.
+   * The number of bytes consumed is manipulated to:
+   * 1) leave data in the receive buffer if no terminators are yet and
+   * 2) to consume one or two terminators as they are discovered. */
+
+  nread = RecvData (cinfo, cinfo->recvbuf, 1, 0);
+
+  if (nread <= 0)
+  {
+    return nread;
+  }
+
+  /* Skip initial terminators, SeedLink v4 requires ignoring empty commands */
+  while (skipped < cinfo->recvlength)
+  {
+    if (cinfo->recvbuf[skipped] == '\n' || cinfo->recvbuf[skipped] == '\r')
+    {
+      skipped++;
+    }
+    else
+    {
+      break;
+    }
+
+    /* If too many initial terminators were received, abort to avoid DoS */
+    if (skipped >= 10)
+    {
+      lprintf (0, "[%s] Received too many empty lines", cinfo->hostname);
+      cinfo->socketerr = -1;
+      return -1;
+    }
+  }
+
+  /* Consume skipped terminators */
+  if (skipped > 0)
+  {
+    cinfo->recvconsumed = skipped;
+
+    nread = RecvData (cinfo, cinfo->recvbuf, 1, 0);
+
+    if (nread <= 0)
+    {
+      return nread;
+    }
+  }
+
+  /* Search for line terminators */
+  char *cr = memchr (cinfo->recvbuf, '\r', cinfo->recvlength);
+  char *nl = memchr (cinfo->recvbuf, '\n', cinfo->recvlength);
+
+  /* If no terminators, preserve data and try to read more */
+  if (cr == NULL && nl == NULL)
+  {
+    cinfo->recvconsumed = 0;
+
+    /* Reject lines exceeding maximum length */
+    if (cinfo->recvlength >= MAX_LINE_LENGTH)
+    {
+      lprintf (0, "[%s] Line too long (%zu bytes, max %d) without terminator",
+               cinfo->hostname, cinfo->recvlength, MAX_LINE_LENGTH);
+      cinfo->socketerr = -1;
+      return -1;
+    }
+
+    /* Buffer full with no terminator: line too long, reject to avoid DoS */
+    if (cinfo->recvlength + 1 > cinfo->recvbufsize)
+    {
+      lprintf (0, "[%s] Line too long without terminator", cinfo->hostname);
+      cinfo->socketerr = -1;
+      return -1;
+    }
+
+    /* Request recvlength + 1 to force RecvData to call recv() for new data */
+    nread = RecvData (cinfo, cinfo->recvbuf, cinfo->recvlength + 1, 0);
+
+    if (nread <= 0)
+      return nread;
+
+    /* Search again with new data */
+    cr = memchr (cinfo->recvbuf, '\r', cinfo->recvlength);
+    nl = memchr (cinfo->recvbuf, '\n', cinfo->recvlength);
+
+    if (cr == NULL && nl == NULL)
+    {
+      cinfo->recvconsumed = 0;
+      return 0;
+    }
+  }
+
+  /* Determine first and last terminator */
+  char *firstterminator = (nl && cr) ? (nl < cr) ? nl : cr : (nl) ? nl : cr;
+  char *lastterminator  = (nl && cr) ? (nl > cr) ? nl : cr : (nl) ? nl : cr;
+
+  /* Ensure the last terminator, if different, directly follows first */
+  if (firstterminator != lastterminator &&
+      (firstterminator + 1) != lastterminator)
+  {
+    lastterminator = firstterminator;
+  }
+
+  /* Set consumed to include all bytes through the last terminator */
+  cinfo->recvconsumed = (lastterminator - cinfo->recvbuf) + 1;
+
+  /* NULL-terminate line at first terminator */
+  *firstterminator = '\0';
+
+  return (int)(firstterminator - cinfo->recvbuf);
+} /* End of RecvLine() */
+
+/***************************************************************************
+ * PollSocket:
+ *
+ * Poll the connected socket for read and/or write ability using poll()
+ * for a specified amount of time.
+ *
+ * The timeout is specified in milliseconds.
+ *
+ * return >=1 : selected event occurred or disconnection
+ * return   0 : if time-out expires
+ * return  <0 : errors, check errno
+ ***************************************************************************/
+int
+PollSocket (int socket, int readability, int writability, int timeout_ms)
+{
+  struct pollfd pfd;
+
+  if (socket < 0 || timeout_ms < 0)
+    return 0;
+
+  pfd.fd     = socket;
+  pfd.events = 0;
+
+  if (readability)
+    pfd.events |= POLLIN;
+
+  if (writability)
+    pfd.events |= POLLOUT;
+
+  /* Quick check with no timeout to avoid timer setup if not needed */
+  int quick_result = poll (&pfd, 1, 0);
+  if (quick_result > 0)
+    return quick_result;
+
+  /* Poll with timeout */
+  return poll (&pfd, 1, timeout_ms);
+} /* End of PollSocket() */
+
+/***************************************************************************
+ * GetStreamNode:
+ *
+ * Search the specified binary tree for a given Key and return the
+ * StreamNode.  If the Key does not exist create it and add it to the
+ * tree.  If adding a new entry in the tree the plock mutex will be
+ * locked.  If a new entry was added the value of new will be set to 1
+ * otherwise it will be set to 0.
+ *
+ * If streams_count >= MAX_STREAMS_PER_CLIENT and the entry does not
+ * exist, creation is refused to prevent unbounded memory growth.
+ *
+ * Return a pointer to a StreamNode or 0 for error.
+ ***************************************************************************/
+StreamNode *
+GetStreamNode (RBTree *tree, pthread_mutex_t *plock, char *streamid,
+               int streams_count, int *new)
+{
+  Key key;
+  Key *newkey;
+  RBNode *rbnode;
+  StreamNode *stream = NULL;
+
+  /* Generate key */
+  key = FNVhash64 (streamid);
+
+  /* Hold the lock across the lookup-or-insert. */
+  pthread_mutex_lock (plock);
+
+  /* Search for a matching entry */
+  if ((rbnode = RBFind (tree, &key)))
+  {
+    stream = (StreamNode *)rbnode->data;
+    *new   = 0;
+    pthread_mutex_unlock (plock);
+    return stream;
+  }
+
+  if (streams_count >= MAX_STREAMS_PER_CLIENT)
+  {
+    pthread_mutex_unlock (plock);
+    lprintf (0, "GetStreamNode: Stream count limit reached (%d)", MAX_STREAMS_PER_CLIENT);
+    return 0;
+  }
+
+  if ((newkey = (Key *)malloc (sizeof (Key))) == NULL)
+  {
+    pthread_mutex_unlock (plock);
+    lprintf (0, "GetStreamNode: Error allocating new key");
+    return 0;
+  }
+
+  *newkey = key;
+
+  if ((stream = (StreamNode *)calloc (1, sizeof (StreamNode))) == NULL)
+  {
+    pthread_mutex_unlock (plock);
+    lprintf (0, "GetStreamNode: Error allocating new node");
+    free (newkey);
+    return 0;
+  }
+
+  /* Initialize the new StreamNode, values that are not 0 */
+  strncpy (stream->streamid, streamid, sizeof (stream->streamid) - 1);
+  stream->streamid[sizeof (stream->streamid) - 1] = '\0';
+
+  RBTreeInsert (tree, newkey, stream, 0);
+  pthread_mutex_unlock (plock);
+
+  *new = 1;
+
+  return stream;
+} /* End of GetStreamNode() */
+
+/***************************************************************************
+ * AddToString:
+ *
+ * Concatinate one string to another with a delimiter in-between
+ * growing the target string as needed up to a maximum length.  The
+ * new addition can be added to either the beggining or end of the
+ * string using the where flag:
+ *
+ * where == 0 means add new addition to end of string
+ * where != 0 means add new addition to beginning of string
+ *
+ * Return 0 on success, -1 on memory allocation error and -2 when
+ * string would grow beyond maximum length.
+ ***************************************************************************/
+int
+AddToString (char **string, char *add, char *delim, size_t where, size_t maxlen)
+{
+  size_t length;
+  char *ptr;
+
+  if (!string || !add)
+    return -1;
+
+  /* If string is empty, allocate space and copy the addition */
+  if (!*string)
+  {
+    length = strlen (add) + 1;
+
+    if (length > maxlen)
+      return -2;
+
+    if ((*string = (char *)malloc (length)) == NULL)
+      return -1;
+
+    strcpy (*string, add);
+  }
+  /* Otherwise add the addition with a delimiter */
+  else
+  {
+    length = strlen (*string) + (delim ? strlen (delim) : 0) + strlen (add) + 1;
+
+    if (length > maxlen)
+      return -2;
+
+    if ((ptr = (char *)malloc (length)) == NULL)
+      return -1;
+
+    /* Put addition at beginning of the string */
+    if (where)
+    {
+      snprintf (ptr, length, "%s%s%s",
+                (add) ? add : "",
+                (delim) ? delim : "",
+                *string);
+    }
+    /* Put addition at end of the string */
+    else
+    {
+      snprintf (ptr, length, "%s%s%s",
+                *string,
+                (delim) ? delim : "",
+                (add) ? add : "");
+    }
+
+    /* Free previous string and set pointer to newly allocated space */
+    free (*string);
+    *string = ptr;
+  }
+
+  return 0;
+} /* End of AddToString() */

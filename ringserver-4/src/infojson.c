@@ -1,0 +1,1483 @@
+/**************************************************************************
+ * infojson.c
+ *
+ * SeedLink client thread specific routines.
+ *
+ * Create JSON formatted information about the server state, including
+ * stream lists, connections, etc.
+ *
+ * This file is part of the ringserver.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Copyright (C) 2026:
+ * @author Chad Trabant, EarthScope Data Services
+ **************************************************************************/
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <libmseed.h>
+
+#include "dlclient.h"
+#include "generic.h"
+#include "infojson.h"
+#include "mseedscan.h"
+#include "ring.h"
+#include "slclient.h"
+#include "yyjson.h"
+
+/***************************************************************************
+ * info_create_root:
+ *
+ * Initialize and populate root JSON object and items that are in all documents.
+ *
+ * Returns pointer to JSON document on success and NULL on error.
+ ***************************************************************************/
+static yyjson_mut_doc *
+info_create_root (const char *software)
+{
+  yyjson_mut_doc *doc;
+  yyjson_mut_val *root;
+  bool success;
+
+  doc = yyjson_mut_doc_new (NULL);
+  if (doc == NULL)
+    return NULL;
+
+  root = yyjson_mut_obj (doc);
+  if (root == NULL)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  yyjson_mut_doc_set_root (doc, root);
+
+  if (yyjson_mut_obj_add_strcpy (doc, root, "software", software) == false)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  pthread_rwlock_rdlock (&config.config_rwlock);
+  success = yyjson_mut_obj_add_strcpy (doc, root, "organization", config.serverid);
+  pthread_rwlock_unlock (&config.config_rwlock);
+
+  if (success == false)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  return doc;
+}
+
+/***************************************************************************
+ * info_add_id:
+ *
+ * Add more details of server ID to the JSON document.
+ *
+ * Returns pointer to JSON document success and NULL on error.
+ ***************************************************************************/
+static yyjson_mut_doc *
+info_add_id (yyjson_mut_doc *doc)
+{
+  yyjson_mut_val *root = yyjson_mut_doc_get_root (doc);
+  yyjson_mut_val *protocols;
+  char string[64] = {0};
+
+  /* Compile-time check that protocol strings fit in the local buffer */
+  _Static_assert (sizeof (DLSERVERPROTOCOLS) <= sizeof (string),
+                  "DLSERVERPROTOCOLS exceeds string buffer size");
+  _Static_assert (sizeof (SLSERVERPROTOCOLS) <= sizeof (string),
+                  "SLSERVERPROTOCOLS exceeds string buffer size");
+  char *cap;
+  char *rest;
+
+  /* Add server start time */
+
+  /* Create server start time string as YYYY-MM-DDTHH:MM:SSZ */
+  ms_nstime2timestr_n (param.serverstarttime, string, sizeof (string), ISOMONTHDAY_Z, NONE);
+
+  if (yyjson_mut_obj_add_strcpy (doc, root, "server_start", string) == false)
+  {
+    return NULL;
+  }
+
+  /* Add DataLink protocols */
+  strncpy (string, DLSERVERPROTOCOLS, sizeof (string) - 1);
+  string[sizeof (string) - 1] = '\0';
+
+  if ((protocols = yyjson_mut_obj_add_arr (doc, root, "datalink_protocol")) == NULL)
+  {
+    return NULL;
+  }
+
+  /* Parse capabilities string on spaces and add each capability */
+  rest = string;
+  while ((cap = strtok_r (rest, " ", &rest)))
+  {
+    if (yyjson_mut_arr_add_strcpy (doc, protocols, cap) == false)
+    {
+      return NULL;
+    }
+  }
+
+  /* Add SeedLink protocols */
+  strncpy (string, SLSERVERPROTOCOLS, sizeof (string) - 1);
+  string[sizeof (string) - 1] = '\0';
+
+  if ((protocols = yyjson_mut_obj_add_arr (doc, root, "seedlink_protocol")) == NULL)
+  {
+    return NULL;
+  }
+
+  /* Parse capabilities string on spaces and add each capability */
+  rest = string;
+  while ((cap = strtok_r (rest, " ", &rest)))
+  {
+    if (yyjson_mut_arr_add_strcpy (doc, protocols, cap) == false)
+    {
+      return NULL;
+    }
+  }
+
+  return doc;
+}
+
+/***************************************************************************
+ * info_json_capabilities:
+ *
+ * Add format specifications to the JSON document.
+ *
+ * Returns pointer to JSON document success and NULL on error.
+ ***************************************************************************/
+static yyjson_mut_doc *
+info_add_capabilities (yyjson_mut_doc *doc)
+{
+  yyjson_mut_val *root = yyjson_mut_doc_get_root (doc);
+  yyjson_mut_val *capability;
+  char *string;
+  char *cap;
+  char *rest;
+
+  if ((string = strdup (SLCAPABILITIESv4)) == NULL)
+  {
+    return NULL;
+  }
+
+  if ((capability = yyjson_mut_obj_add_arr (doc, root, "capability")) == NULL)
+  {
+    free (string);
+    return NULL;
+  }
+
+  /* Parse capabilities string on spaces and add each capability */
+  rest = string;
+  while ((cap = strtok_r (rest, " ", &rest)))
+  {
+    if (yyjson_mut_arr_add_strcpy (doc, capability, cap) == false)
+    {
+      free (string);
+      return NULL;
+    }
+  }
+
+  free (string);
+
+  /* Add AUTH capability if enabled in the server.  The server delegates
+   * authentication to an external program and does not know which AUTH
+   * types it accepts, so advertise the bare "AUTH" capability. */
+  pthread_rwlock_rdlock (&config.config_rwlock);
+  if (config.auth.program)
+  {
+    if (!yyjson_mut_arr_add_strcpy (doc, capability, "AUTH"))
+    {
+      pthread_rwlock_unlock (&config.config_rwlock);
+      return NULL;
+    }
+  }
+  pthread_rwlock_unlock (&config.config_rwlock);
+
+  return doc;
+}
+
+/***************************************************************************
+ * info_add_formats:
+ *
+ * Add format specifications to the JSON document.
+ *
+ * Returns pointer to JSON object added on success and NULL on error.
+ ***************************************************************************/
+static yyjson_mut_doc *
+info_add_formats (yyjson_mut_doc *doc)
+{
+  yyjson_mut_val *root = yyjson_mut_doc_get_root (doc);
+  yyjson_mut_val *format;
+  yyjson_mut_val *item;
+  yyjson_mut_val *subformat;
+
+  if ((format = yyjson_mut_obj_add_obj (doc, root, "format")) == NULL)
+  {
+    return NULL;
+  }
+
+  /* Add format code for miniSEED 2 */
+  if ((item = yyjson_mut_obj_add_obj (doc, format, "2")) == NULL ||
+      yyjson_mut_obj_add_strcpy (doc, item, "mimetype", "application/vnd.fdsn.mseed") == false ||
+      ((subformat = yyjson_mut_obj_add_obj (doc, item, "subformat")) == NULL) ||
+      yyjson_mut_obj_add_strcpy (doc, subformat, "D", "Data") == false)
+  {
+    return NULL;
+  }
+
+  /* Add format code for miniSEED 3 */
+  if ((item = yyjson_mut_obj_add_obj (doc, format, "3")) == NULL ||
+      yyjson_mut_obj_add_strcpy (doc, item, "mimetype", "application/vnd.fdsn.mseed3") == false ||
+      ((subformat = yyjson_mut_obj_add_obj (doc, item, "subformat")) == NULL) ||
+      yyjson_mut_obj_add_strcpy (doc, subformat, "D", "Data") == false)
+  {
+    return NULL;
+  }
+
+  return doc;
+}
+
+/***************************************************************************
+ * info_add_filters:
+ *
+ * Add filter specifications to the JSON document.
+ *
+ * Returns pointer to JSON document success and NULL on error.
+ ***************************************************************************/
+static yyjson_mut_doc *
+info_add_filters (yyjson_mut_doc *doc)
+{
+  yyjson_mut_val *root = yyjson_mut_doc_get_root (doc);
+  yyjson_mut_val *filter;
+
+  if ((filter = yyjson_mut_obj_add_obj (doc, root, "filter")) == NULL)
+  {
+    return NULL;
+  }
+
+  /* Add filter code for native */
+  if (yyjson_mut_obj_add_strcpy (doc, filter, "native", "native format of data, no conversion") == false)
+  {
+    return NULL;
+  }
+
+  /* Add filter code for miniSEED 3 */
+  if (yyjson_mut_obj_add_strcpy (doc, filter, "3", "data in miniSEED v3 (if possible)") == false)
+  {
+    return NULL;
+  }
+
+  return doc;
+}
+
+/***************************************************************************
+ * info_add_streams:
+ *
+ * Add stream array to the JSON document.
+ *
+ * Returns pointer to JSON document success and NULL on error.
+ ***************************************************************************/
+static yyjson_mut_doc *
+info_add_streams (ClientInfo *cinfo, yyjson_mut_doc *doc, const char *matchexpr)
+{
+  yyjson_mut_val *root = yyjson_mut_doc_get_root (doc);
+  yyjson_mut_val *stream_array;
+  yyjson_mut_val *stream;
+
+  Stack *ringstreams;
+  RingStream *ringstream;
+
+  char string32[32]    = {0};
+  uint32_t streamcount = 0;
+
+  pcre2_code *match_code       = NULL;
+  pcre2_match_data *match_data = NULL;
+
+  /* Save and temporarily clear persistent match/reject when matchexpr overrides.
+   * The reader's allowed/forbidden (server access controls) must still apply. */
+  pcre2_code *saved_match             = NULL;
+  pcre2_match_data *saved_match_data  = NULL;
+  pcre2_code *saved_reject            = NULL;
+  pcre2_match_data *saved_reject_data = NULL;
+
+  /* Compile match expression if provided */
+  if (matchexpr && *matchexpr && UpdatePattern (&match_code, &match_data, matchexpr, "stream match expression"))
+  {
+    if (match_code)
+      pcre2_code_free (match_code);
+    if (match_data)
+      pcre2_match_data_free (match_data);
+    return NULL;
+  }
+
+  /* If matchexpr overrides, temporarily clear the reader's persistent match/reject
+   * so GetStreamsStack only applies server-side allowed/forbidden filters */
+  if (match_code && cinfo->reader)
+  {
+    saved_match                = cinfo->reader->match;
+    saved_match_data           = cinfo->reader->match_data;
+    saved_reject               = cinfo->reader->reject;
+    saved_reject_data          = cinfo->reader->reject_data;
+    cinfo->reader->match       = NULL;
+    cinfo->reader->match_data  = NULL;
+    cinfo->reader->reject      = NULL;
+    cinfo->reader->reject_data = NULL;
+  }
+
+  /* Get copy of streams as a Stack, sorted by stream ID */
+  ringstreams = GetStreamsStack (cinfo->reader);
+
+  /* Restore the reader's persistent match/reject */
+  if (saved_match || saved_reject)
+  {
+    cinfo->reader->match       = saved_match;
+    cinfo->reader->match_data  = saved_match_data;
+    cinfo->reader->reject      = saved_reject;
+    cinfo->reader->reject_data = saved_reject_data;
+  }
+
+  if (ringstreams == NULL)
+  {
+    lprintf (0, "[%s] Error getting streams stack", cinfo->hostname);
+    if (match_code)
+      pcre2_code_free (match_code);
+    if (match_data)
+      pcre2_match_data_free (match_data);
+    return NULL;
+  }
+
+  /* Create JSON */
+  if ((stream_array = yyjson_mut_obj_add_arr (doc, root, "stream")) == NULL)
+  {
+    StackDestroy (ringstreams, free);
+    if (match_code)
+      pcre2_code_free (match_code);
+    if (match_data)
+      pcre2_match_data_free (match_data);
+    return NULL;
+  }
+
+  /* Add streams to array */
+  int match_limit_logged = 0;
+  while ((ringstream = (RingStream *)StackPop (ringstreams)))
+  {
+    /* Skip if stream ID does not match provided expression */
+    if (match_code)
+    {
+      int match_rc = pcre2_match (match_code, (PCRE2_SPTR8)ringstream->streamid,
+                                  PCRE2_ZERO_TERMINATED, 0, 0, match_data, GetMatchContext ());
+      if (match_rc < 0)
+      {
+        if (!match_limit_logged &&
+            (match_rc == PCRE2_ERROR_MATCHLIMIT ||
+             match_rc == PCRE2_ERROR_DEPTHLIMIT ||
+             match_rc == PCRE2_ERROR_HEAPLIMIT))
+        {
+          lprintf (1, "[%s] PCRE2 match limit reached for stream match expression, treating as no match",
+                   cinfo->hostname);
+          match_limit_logged = 1;
+        }
+        free (ringstream);
+        continue;
+      }
+    }
+
+    stream = yyjson_mut_arr_add_obj (doc, stream_array);
+
+    yyjson_mut_obj_add_strcpy (doc, stream, "id", ringstream->streamid);
+
+    ms_nstime2timestr_n (ringstream->earliestdstime, string32, sizeof (string32), ISOMONTHDAY_Z, MICRO);
+    yyjson_mut_obj_add_strcpy (doc, stream, "start_time", string32);
+
+    ms_nstime2timestr_n (ringstream->latestdetime, string32, sizeof (string32), ISOMONTHDAY_Z, MICRO);
+    yyjson_mut_obj_add_strcpy (doc, stream, "end_time", string32);
+
+    yyjson_mut_obj_add_uint (doc, stream, "earliest_packet_id", ringstream->earliestid);
+
+    ms_nstime2timestr_n (ringstream->earliestptime, string32, sizeof (string32), ISOMONTHDAY_Z, MICRO);
+    yyjson_mut_obj_add_strcpy (doc, stream, "earliest_packet_time", string32);
+
+    ms_nstime2timestr_n (ringstream->latestptime, string32, sizeof (string32), ISOMONTHDAY_Z, MICRO);
+    yyjson_mut_obj_add_strcpy (doc, stream, "latest_packet_time", string32);
+
+    yyjson_mut_obj_add_uint (doc, stream, "latest_packet_id", ringstream->latestid);
+
+    /* Data latency: the difference between the current time and time of last sample in seconds */
+    yyjson_mut_obj_add_real (doc, stream, "data_latency",
+                             (double)MS_NSTIME2EPOCH ((NSnow () - ringstream->latestdetime)));
+
+    free (ringstream);
+
+    if (streamcount == UINT32_MAX)
+    {
+      lprintf (0, "[%s] Error: stream count exceeded UINT32_MAX", cinfo->hostname);
+      break;
+    }
+
+    streamcount++;
+  }
+
+  yyjson_mut_obj_add_uint (doc, root, "stream_count", streamcount);
+
+  StackDestroy (ringstreams, free);
+
+  if (match_code)
+    pcre2_code_free (match_code);
+  if (match_data)
+    pcre2_match_data_free (match_data);
+
+  return doc;
+}
+
+/***************************************************************************
+ * info_add_stations:
+ *
+ * Add station array, and optionally a stream sub-array, to the JSON document.
+ *
+ * Returns pointer to JSON document success and NULL on error.
+ ***************************************************************************/
+static yyjson_mut_doc *
+info_add_stations (ClientInfo *cinfo, yyjson_mut_doc *doc, int include_streams,
+                   const char *matchexpr)
+{
+  yyjson_mut_val *root = yyjson_mut_doc_get_root (doc);
+  yyjson_mut_val *station_array;
+  yyjson_mut_val *station;
+  yyjson_mut_val *stream_array;
+  yyjson_mut_val *stream;
+
+  Stack *ringstreams;
+  RingStream *ringstream;
+
+  struct station_details
+  {
+    char id[MAXSTREAMID];
+    uint64_t earliestid;
+    uint64_t latestid;
+    Stack *streams;
+  };
+
+  struct stream_details
+  {
+    char id[MAXSTREAMID];
+    char format[2];
+    char subformat[2];
+    nstime_t earliesttime;
+    nstime_t latesttime;
+  };
+
+  struct station_details *station_details = NULL;
+  struct stream_details *stream_details   = NULL;
+
+  Stack *station_stack = NULL;
+
+  char net[MAXSTREAMID]  = {0};
+  char sta[MAXSTREAMID]  = {0};
+  char loc[MAXSTREAMID]  = {0};
+  char chan[MAXSTREAMID] = {0};
+
+  char staid[MAXSTREAMID]    = {0};
+  char streamid[MAXSTREAMID] = {0};
+
+  int error         = 0;
+  char *type        = NULL;
+  char string96[96] = {0};
+
+  pcre2_code *match_code       = NULL;
+  pcre2_match_data *match_data = NULL;
+
+  /* Compile match expression if provided */
+  if (matchexpr && *matchexpr && UpdatePattern (&match_code, &match_data, matchexpr, "stream match expression"))
+  {
+    if (match_code)
+      pcre2_code_free (match_code);
+    if (match_data)
+      pcre2_match_data_free (match_data);
+    return NULL;
+  }
+
+  /* Get copy of streams as a Stack, sorted by stream ID */
+  ringstreams = GetStreamsStack (cinfo->reader);
+
+  if (ringstreams == NULL)
+  {
+    lprintf (0, "[%s] Error getting streams stack", cinfo->hostname);
+    if (match_code)
+      pcre2_code_free (match_code);
+    if (match_data)
+      pcre2_match_data_free (match_data);
+    return NULL;
+  }
+
+  if ((station_stack = StackCreate ()) == NULL)
+  {
+    lprintf (0, "[%s] Error allocating memory", cinfo->hostname);
+    StackDestroy (ringstreams, free);
+    if (match_code)
+      pcre2_code_free (match_code);
+    if (match_data)
+      pcre2_match_data_free (match_data);
+    return NULL;
+  }
+
+  /* Build Stacks of stations and optionally streams */
+  int match_limit_logged = 0;
+  while ((ringstream = (RingStream *)StackPop (ringstreams)))
+  {
+    /* Skip if stream ID does not match provided expression */
+    if (match_code)
+    {
+      int match_rc = pcre2_match (match_code, (PCRE2_SPTR8)ringstream->streamid,
+                                  PCRE2_ZERO_TERMINATED, 0, 0, match_data, GetMatchContext ());
+      if (match_rc < 0)
+      {
+        if (!match_limit_logged &&
+            (match_rc == PCRE2_ERROR_MATCHLIMIT ||
+             match_rc == PCRE2_ERROR_DEPTHLIMIT ||
+             match_rc == PCRE2_ERROR_HEAPLIMIT))
+        {
+          lprintf (1, "[%s] PCRE2 match limit reached for stream match expression, treating as no match",
+                   cinfo->hostname);
+          match_limit_logged = 1;
+        }
+        free (ringstream);
+        continue;
+      }
+    }
+
+    /* Truncate stream ID at type suffix */
+    if ((type = strchr (ringstream->streamid, '/')))
+      *type++ = '\0';
+
+    /* Extract codes from FDSN Source ID (streamid) */
+    if (strncmp (ringstream->streamid, "FDSN:", 5) == 0)
+    {
+      if (ms_sid2nslc_n (ringstream->streamid, net, sizeof (net),
+                         sta, sizeof (sta),
+                         loc, sizeof (loc),
+                         chan, sizeof (chan)))
+      {
+        lprintf (0, "[%s] Error splitting stream ID: %s", cinfo->hostname, ringstream->streamid);
+        free (ringstream);
+        error = 1;
+        break;
+      }
+
+      /* Create station ID as combination of network and station codes */
+      snprintf (staid, sizeof (staid), "%.10s_%.10s", net, sta);
+
+      /* Create stream ID as combination of location and channel codes,
+       * expanding SEED channel if needed */
+      if (strlen (chan) == 3)
+        snprintf (streamid, sizeof (streamid), "%.10s_%c_%c_%c", loc, chan[0], chan[1], chan[2]);
+      else
+        snprintf (streamid, sizeof (streamid), "%.10s_%.30s", loc, chan);
+    }
+    /* Otherwise use the stream ID as the station and stream IDs */
+    else
+    {
+      strncpy (staid, ringstream->streamid, sizeof (staid) - 1);
+      staid[sizeof (staid) - 1] = '\0';
+      strncpy (streamid, ringstream->streamid, sizeof (streamid) - 1);
+      streamid[sizeof (streamid) - 1] = '\0';
+    }
+
+    /* Create new station entry and add to stack */
+    if (station_details == NULL || strcmp (station_details->id, staid) != 0)
+    {
+      station_details = (struct station_details *)malloc (sizeof (struct station_details));
+      if (station_details == NULL)
+      {
+        lprintf (0, "[%s] Error allocating memory", cinfo->hostname);
+        free (ringstream);
+        error = 1;
+        break;
+      }
+
+      memcpy (station_details->id, staid, sizeof (station_details->id));
+      station_details->earliestid = ringstream->earliestid;
+      station_details->latestid   = ringstream->latestid;
+
+      if (include_streams)
+      {
+        if ((station_details->streams = StackCreate ()) == NULL)
+        {
+          lprintf (0, "[%s] Error allocating memory", cinfo->hostname);
+          free (station_details);
+          station_details = NULL;
+          free (ringstream);
+          error = 1;
+          break;
+        }
+      }
+      else
+      {
+        station_details->streams = NULL;
+      }
+
+      StackUnshift (station_stack, station_details);
+    }
+    /* Otherwise, update station entry */
+    else
+    {
+      if (station_details->earliestid > ringstream->earliestid)
+        station_details->earliestid = ringstream->earliestid;
+      if (station_details->latestid < ringstream->latestid)
+        station_details->latestid = ringstream->latestid;
+    }
+
+    /* Add stream details if requested */
+    if (station_details->streams != NULL)
+    {
+      stream_details = (struct stream_details *)malloc (sizeof (struct stream_details));
+      if (stream_details == NULL)
+      {
+        lprintf (0, "[%s] Error allocating memory", cinfo->hostname);
+        free (ringstream);
+        error = 1;
+        break;
+      }
+
+      memcpy (stream_details->id, streamid, sizeof (stream_details->id));
+
+      if (type && strstr (type, "MSEED3"))
+      {
+        strcpy (stream_details->format, "3");
+      }
+      else if (type && strstr (type, "MSEED"))
+      {
+        strcpy (stream_details->format, "2");
+      }
+      else
+      {
+        strcpy (stream_details->format, "?");
+      }
+
+      strcpy (stream_details->subformat, "D");
+
+      stream_details->earliesttime = ringstream->earliestdstime;
+      stream_details->latesttime   = ringstream->latestdetime;
+
+      StackUnshift (station_details->streams, stream_details);
+    }
+
+    free (ringstream);
+  }
+
+  StackDestroy (ringstreams, free);
+
+  if (!error)
+  {
+    /* Create JSON */
+    station_array = yyjson_mut_obj_add_arr (doc, root, "station");
+
+    /* Traverse station stack creating "station" entries */
+    while ((station_details = (struct station_details *)StackPop (station_stack)) && !error)
+    {
+      station = yyjson_mut_arr_add_obj (doc, station_array);
+
+      yyjson_mut_obj_add_strcpy (doc, station, "id", station_details->id);
+      snprintf (string96, sizeof (string96), "Station ID %s", station_details->id);
+      yyjson_mut_obj_add_strcpy (doc, station, "description", string96);
+      yyjson_mut_obj_add_uint (doc, station, "start_seq", station_details->earliestid);
+      /* end_seq is the next sequence number, i.e. latest available + 1, per the SeedLink v4 INFO schema.
+       * Guard against unset/sentinel values (RINGID_NONE etc.) by emitting 0 when out of valid range. */
+      yyjson_mut_obj_add_uint (doc, station, "end_seq",
+                               (station_details->latestid <= RINGID_MAXIMUM)
+                                   ? station_details->latestid + 1
+                                   : 0);
+
+      if (station_details->streams)
+      {
+        stream_array = yyjson_mut_obj_add_arr (doc, station, "stream");
+
+        /* Traverse stream stack creating "stream" entries */
+        while ((stream_details = (struct stream_details *)StackPop (station_details->streams)))
+        {
+          stream = yyjson_mut_arr_add_obj (doc, stream_array);
+
+          yyjson_mut_obj_add_strcpy (doc, stream, "id", stream_details->id);
+          yyjson_mut_obj_add_strcpy (doc, stream, "format", stream_details->format);
+          yyjson_mut_obj_add_strcpy (doc, stream, "subformat", stream_details->subformat);
+
+          ms_nstime2timestr_n (stream_details->earliesttime, string96, sizeof (string96), ISOMONTHDAY_Z, MICRO);
+          yyjson_mut_obj_add_strcpy (doc, stream, "start_time", string96);
+          ms_nstime2timestr_n (stream_details->latesttime, string96, sizeof (string96), ISOMONTHDAY_Z, MICRO);
+          yyjson_mut_obj_add_strcpy (doc, stream, "end_time", string96);
+
+          free (stream_details);
+        }
+
+        StackDestroy (station_details->streams, free);
+      }
+
+      free (station_details);
+    }
+  }
+
+  /* Free all temporary allocations */
+  while ((station_details = (struct station_details *)StackPop (station_stack)))
+  {
+    if (station_details->streams)
+    {
+      StackDestroy (station_details->streams, free);
+    }
+
+    free (station_details);
+  }
+
+  StackDestroy (station_stack, free);
+
+  if (match_code)
+    pcre2_code_free (match_code);
+  if (match_data)
+    pcre2_match_data_free (match_data);
+
+  /* Return NULL on any build error so the caller can report the failure */
+  if (error)
+    return NULL;
+
+  return doc;
+}
+
+/***************************************************************************
+ * info_add_connections:
+ *
+ * Add server connections to the JSON document.
+ *
+ * Returns pointer to JSON object added on success and NULL on error.
+ ***************************************************************************/
+static yyjson_mut_doc *
+info_add_connections (ClientInfo *cinfo, yyjson_mut_doc *doc, const char *matchexpr)
+{
+  (void)cinfo; /* Unused for now, suppress compiler warning */
+  yyjson_mut_val *root = yyjson_mut_doc_get_root (doc);
+  yyjson_mut_val *connections;
+  yyjson_mut_val *client_array;
+  yyjson_mut_val *client;
+
+  struct cthread *loopctp;
+  ClientInfo *tcinfo;
+  nstime_t nsnow;
+
+  char conntype[64];
+  char timestring[50];
+  char packettime[50];
+
+  pcre2_code *match_code       = NULL;
+  pcre2_match_data *match_data = NULL;
+
+  /* Compile match expression if provided */
+  if (matchexpr && UpdatePattern (&match_code, &match_data, matchexpr, "connection match expression"))
+  {
+    if (match_code)
+      pcre2_code_free (match_code);
+    if (match_data)
+      pcre2_match_data_free (match_data);
+    return NULL;
+  }
+
+  if ((connections = yyjson_mut_obj_add_obj (doc, root, "connections")) == NULL ||
+      (client_array = yyjson_mut_obj_add_arr (doc, connections, "client")) == NULL)
+  {
+    return NULL;
+  }
+
+  yyjson_mut_obj_add_int (doc, connections, "client_count", param.clientcount);
+
+  nsnow = NSnow ();
+
+  int match_limit_logged = 0;
+  int error              = 0;
+
+  /* List connections, lock client list while looping */
+  pthread_mutex_lock (&param.cthreads_lock);
+  for (loopctp = param.cthreads; loopctp != NULL; loopctp = loopctp->next)
+  {
+    /* Skip if client thread is not in ACTIVE state */
+    if (loopctp->td->td_state != TDS_ACTIVE)
+    {
+      continue;
+    }
+
+    tcinfo = (ClientInfo *)loopctp->td->td_prvtptr;
+
+    /* Skip if client does not match provided expression */
+    if (match_code)
+    {
+      pcre2_match_context *mctx = GetMatchContext ();
+      int rc_host               = pcre2_match (match_code, (PCRE2_SPTR8)tcinfo->hostname, PCRE2_ZERO_TERMINATED, 0, 0, match_data, mctx);
+      int rc_ip                 = (rc_host < 0) ? pcre2_match (match_code, (PCRE2_SPTR8)tcinfo->ipstr, PCRE2_ZERO_TERMINATED, 0, 0, match_data, mctx) : 1;
+      int rc_clientid           = (rc_ip < 0) ? pcre2_match (match_code, (PCRE2_SPTR8)tcinfo->clientid, PCRE2_ZERO_TERMINATED, 0, 0, match_data, mctx) : 1;
+
+      if (rc_host < 0 && rc_ip < 0 && rc_clientid < 0)
+      {
+        if (!match_limit_logged &&
+            (rc_host == PCRE2_ERROR_MATCHLIMIT || rc_host == PCRE2_ERROR_DEPTHLIMIT || rc_host == PCRE2_ERROR_HEAPLIMIT ||
+             rc_ip == PCRE2_ERROR_MATCHLIMIT || rc_ip == PCRE2_ERROR_DEPTHLIMIT || rc_ip == PCRE2_ERROR_HEAPLIMIT ||
+             rc_clientid == PCRE2_ERROR_MATCHLIMIT || rc_clientid == PCRE2_ERROR_DEPTHLIMIT || rc_clientid == PCRE2_ERROR_HEAPLIMIT))
+        {
+          lprintf (1, "[%s] PCRE2 match limit reached for connection match expression, treating as no match",
+                   tcinfo->hostname);
+          match_limit_logged = 1;
+        }
+        continue;
+      }
+    }
+
+    /* Determine connection type */
+    if (tcinfo->type == CLIENT_DATALINK)
+    {
+      snprintf (conntype, sizeof (conntype), "DataLink%s%s%s",
+                tcinfo->websocket ? ":WebSocket" : "",
+                tcinfo->tls ? ":TLS" : "",
+                tcinfo->proxyv2 ? ":PROXYv2" : "");
+    }
+    else if (tcinfo->type == CLIENT_SEEDLINK)
+    {
+      snprintf (conntype, sizeof (conntype), "SeedLink%s%s%s",
+                tcinfo->websocket ? ":WebSocket" : "",
+                tcinfo->tls ? ":TLS" : "",
+                tcinfo->proxyv2 ? ":PROXYv2" : "");
+    }
+    else if (tcinfo->type == CLIENT_HTTP)
+    {
+      snprintf (conntype, sizeof (conntype), "%s%s",
+                tcinfo->tls ? "HTTPS" : "HTTP",
+                tcinfo->proxyv2 ? ":PROXYv2" : "");
+    }
+    else
+    {
+      snprintf (conntype, sizeof (conntype), "Unknown%s",
+                tcinfo->proxyv2 ? ":PROXYv2" : "");
+    }
+
+    client = yyjson_mut_arr_add_obj (doc, client_array);
+
+    yyjson_mut_obj_add_strcpy (doc, client, "host", tcinfo->hostname);
+    yyjson_mut_obj_add_strcpy (doc, client, "ip_address", tcinfo->ipstr);
+    yyjson_mut_obj_add_strcpy (doc, client, "client_port", tcinfo->portstr);
+    yyjson_mut_obj_add_strcpy (doc, client, "server_port", tcinfo->serverport);
+    yyjson_mut_obj_add_strcpy (doc, client, "type", conntype);
+    if (tcinfo->clientid[0])
+      yyjson_mut_obj_add_strcpy (doc, client, "client_id", tcinfo->clientid);
+
+    yyjson_mut_obj_add_bool (doc, client, "authenticated", tcinfo->permissions & AUTHENTICATED);
+    yyjson_mut_obj_add_bool (doc, client, "write_permission", tcinfo->permissions & WRITE_PERMISSION);
+    yyjson_mut_obj_add_bool (doc, client, "trust_permission", tcinfo->permissions & TRUST_PERMISSION);
+
+    ms_nstime2timestr_n (tcinfo->conntime, timestring, sizeof (timestring), ISOMONTHDAY_Z, NONE);
+    yyjson_mut_obj_add_strcpy (doc, client, "connect_time", timestring);
+
+    if (tcinfo->reader->pktid <= RINGID_MAXIMUM)
+    {
+      yyjson_mut_obj_add_uint (doc, client, "packet_id", tcinfo->reader->pktid);
+    }
+
+    if (tcinfo->reader->pkttime != NSTUNSET)
+    {
+      ms_nstime2timestr_n (tcinfo->reader->pkttime, packettime, sizeof (packettime), ISOMONTHDAY_Z, NANO_MICRO_NONE);
+      yyjson_mut_obj_add_strcpy (doc, client, "packet_creation_time", packettime);
+    }
+
+    yyjson_mut_obj_add_int (doc, client, "lag_percent", (tcinfo->reader->pktid > RINGID_MAXIMUM) ? 0 : tcinfo->percentlag);
+    yyjson_mut_obj_add_real (doc, client, "lag_seconds", (double)MS_NSTIME2EPOCH ((nsnow - tcinfo->lastxchange)));
+
+    yyjson_mut_obj_add_uint (doc, client, "transmit_packets", tcinfo->txpackets0);
+    yyjson_mut_obj_add_real (doc, client, "transmit_packet_rate", tcinfo->txpacketrate);
+    yyjson_mut_obj_add_uint (doc, client, "transmit_bytes", tcinfo->txbytes0);
+    yyjson_mut_obj_add_real (doc, client, "transmit_byte_rate", tcinfo->txbyterate);
+
+    yyjson_mut_obj_add_uint (doc, client, "receive_packets", tcinfo->rxpackets0);
+    yyjson_mut_obj_add_real (doc, client, "receive_packet_rate", tcinfo->rxpacketrate);
+    yyjson_mut_obj_add_uint (doc, client, "receive_bytes", tcinfo->rxbytes0);
+    yyjson_mut_obj_add_real (doc, client, "receive_byte_rate", tcinfo->rxbyterate);
+
+    yyjson_mut_obj_add_int (doc, client, "stream_count", tcinfo->streamscount);
+
+    if (tcinfo->matchstr)
+      yyjson_mut_obj_add_strcpy (doc, client, "match", tcinfo->matchstr);
+    if (tcinfo->rejectstr)
+      yyjson_mut_obj_add_strcpy (doc, client, "reject", tcinfo->rejectstr);
+
+    /* DataLink-specific details */
+    if (tcinfo->type == CLIENT_DATALINK)
+    {
+      char string32[32] = {0};
+
+      snprintf (string32, sizeof (string32), "%u.%u", DLPROTO_MAJOR, DLPROTO_MINOR);
+      yyjson_mut_obj_add_strcpy (doc, client, "protocol_version", string32);
+    }
+
+    /* SeedLink-specific stations and selectors */
+    if (tcinfo->type == CLIENT_SEEDLINK && tcinfo->extinfo)
+    {
+      SLInfo *slinfo = (SLInfo *)tcinfo->extinfo;
+
+      char string32[32] = {0};
+
+      ReqStationID *stationid;
+      Stack *stack = StackCreate ();
+      RBNode *rbnode;
+
+      if (!stack)
+      {
+        lprintf (0, "[%s] Error allocating memory for station stack", cinfo->hostname);
+        error = 1;
+        break;
+      }
+
+      snprintf (string32, sizeof (string32), "%u.%u", slinfo->proto_major, slinfo->proto_minor);
+      yyjson_mut_obj_add_strcpy (doc, client, "protocol_version", string32);
+
+      yyjson_mut_obj_add_bool (doc, client, "dialup_mode", slinfo->dialup);
+
+      if (slinfo->proto_major == 3)
+      {
+        yyjson_mut_obj_add_bool (doc, client, "batch_mode", slinfo->batch);
+        yyjson_mut_obj_add_bool (doc, client, "extended_reply", slinfo->extreply);
+      }
+
+      if (slinfo->selectors)
+      {
+        yyjson_mut_val *selector_array = yyjson_mut_obj_add_arr (doc, client, "selector");
+
+        for (Selector *selector = slinfo->selectors; selector; selector = selector->next)
+        {
+          char value[MAXSTREAMID + 3];
+
+          if (selector->convert == CONVERT_MSEED3)
+          {
+            snprintf (value, sizeof (value), "%s:3", selector->string);
+          }
+          else
+          {
+            snprintf (value, sizeof (value), "%s", selector->string);
+          }
+
+          yyjson_mut_arr_add_strcpy (doc, selector_array, value);
+        }
+      }
+
+      yyjson_mut_val *station_array = yyjson_mut_obj_add_arr (doc, client, "station");
+
+      RBBuildStack (slinfo->stations, stack);
+
+      while ((rbnode = (RBNode *)StackPop (stack)))
+      {
+        stationid = (ReqStationID *)rbnode->data;
+
+        yyjson_mut_val *station = yyjson_mut_arr_add_obj (doc, station_array);
+
+        yyjson_mut_obj_add_strcpy (doc, station, "id", (const char *)rbnode->key);
+
+        if (stationid->starttime != NSTUNSET)
+        {
+          ms_nstime2timestr_n (stationid->starttime, timestring, sizeof (timestring), ISOMONTHDAY_Z, NONE);
+          yyjson_mut_obj_add_strcpy (doc, station, "start_time", timestring);
+        }
+
+        if (stationid->endtime != NSTUNSET)
+        {
+          ms_nstime2timestr_n (stationid->endtime, timestring, sizeof (timestring), ISOMONTHDAY_Z, NONE);
+          yyjson_mut_obj_add_strcpy (doc, station, "end_time", timestring);
+        }
+
+        if (stationid->packetid <= RINGID_MAXIMUM)
+        {
+          yyjson_mut_obj_add_uint (doc, station, "start_packet_id", stationid->packetid);
+        }
+
+        if (stationid->datastart != NSTUNSET)
+        {
+          ms_nstime2timestr_n (stationid->datastart, timestring, sizeof (timestring), ISOMONTHDAY_Z, NONE);
+          yyjson_mut_obj_add_strcpy (doc, station, "start_packet_time", timestring);
+        }
+
+        if (stationid->selectors)
+        {
+          yyjson_mut_val *selector_array = yyjson_mut_obj_add_arr (doc, station, "selector");
+
+          for (Selector *selector = stationid->selectors; selector; selector = selector->next)
+          {
+            char value[MAXSTREAMID + 3];
+
+            if (selector->convert == CONVERT_MSEED3)
+            {
+              snprintf (value, sizeof (value), "%s:3", selector->string);
+            }
+            else
+            {
+              snprintf (value, sizeof (value), "%s", selector->string);
+            }
+
+            yyjson_mut_arr_add_strcpy (doc, selector_array, value);
+          }
+        }
+      }
+
+      StackDestroy (stack, 0);
+    }
+  }
+  pthread_mutex_unlock (&param.cthreads_lock);
+
+  if (match_code)
+    pcre2_code_free (match_code);
+  if (match_data)
+    pcre2_match_data_free (match_data);
+
+  /* Return NULL on any build error so the caller can report the failure */
+  if (error)
+    return NULL;
+
+  return doc;
+}
+
+/***************************************************************************
+ * add_ipnet_array:
+ *
+ * Add an array of IP network entries to a JSON parent object.
+ * Each entry has "network", "netmask", and "family" fields.
+ * When include_pattern is true, a "pattern" field is added for entries
+ * that carry a limitstr (stream pattern for allowed/forbidden lists).
+ *
+ * Must be called with config.config_rwlock held for reading.
+ *
+ * Returns true on success and false on error.
+ ***************************************************************************/
+static bool
+add_ipnet_array (yyjson_mut_doc *doc, yyjson_mut_val *parent,
+                 const char *key, IPNet *list, bool include_pattern)
+{
+  char network[INET6_ADDRSTRLEN];
+  char netmask[INET6_ADDRSTRLEN];
+
+  yyjson_mut_val *array = yyjson_mut_obj_add_arr (doc, parent, key);
+  if (array == NULL)
+    return false;
+
+  for (IPNet *ipn = list; ipn != NULL; ipn = ipn->next)
+  {
+    inet_ntop (ipn->family, &ipn->network, network, sizeof (network));
+    inet_ntop (ipn->family, &ipn->netmask, netmask, sizeof (netmask));
+
+    yyjson_mut_val *entry = yyjson_mut_arr_add_obj (doc, array);
+    if (entry == NULL)
+      return false;
+
+    if (yyjson_mut_obj_add_strcpy (doc, entry, "network", network) == false ||
+        yyjson_mut_obj_add_strcpy (doc, entry, "netmask", netmask) == false ||
+        yyjson_mut_obj_add_strcpy (doc, entry, "family",
+                                   (ipn->family == AF_INET6) ? "IPv6" : "IPv4") == false)
+      return false;
+
+    if (include_pattern && ipn->limitstr)
+    {
+      if (yyjson_mut_obj_add_strcpy (doc, entry, "pattern", ipn->limitstr) == false)
+        return false;
+    }
+  }
+
+  return true;
+}
+
+/***************************************************************************
+ * info_add_status:
+ *
+ * Add server status (runtime state and configuration parameters) to the
+ * JSON document under a single "server" object.
+ *
+ * Returns pointer to JSON object added on success and NULL on error.
+ ***************************************************************************/
+static yyjson_mut_doc *
+info_add_status (yyjson_mut_doc *doc)
+{
+  RingPacket packet;
+  uint64_t pktid;
+  yyjson_mut_val *root = yyjson_mut_doc_get_root (doc);
+  yyjson_mut_val *server;
+  yyjson_mut_val *thread_array;
+  yyjson_mut_val *thread;
+  yyjson_mut_val *auth;
+  yyjson_mut_val *ulog;
+  yyjson_mut_val *modes;
+
+  struct sthread *loopstp;
+
+  char timestr[50];
+
+  if ((server = yyjson_mut_obj_add_obj (doc, root, "server")) == NULL ||
+      (thread_array = yyjson_mut_obj_add_arr (doc, server, "thread")) == NULL)
+  {
+    return NULL;
+  }
+
+  pthread_rwlock_rdlock (&config.config_rwlock);
+
+  yyjson_mut_obj_add_uint (doc, server, "ring_version", param.version);
+  yyjson_mut_obj_add_uint (doc, server, "ring_size", param.ringsize);
+  yyjson_mut_obj_add_uint (doc, server, "packet_size", param.pktsize);
+  yyjson_mut_obj_add_uint (doc, server, "maximum_packets", param.maxpackets);
+  yyjson_mut_obj_add_bool (doc, server, "memory_mapped", config.memorymapring);
+  yyjson_mut_obj_add_bool (doc, server, "volatile_ring", config.volatilering);
+  yyjson_mut_obj_add_bool (doc, server, "fdsn_source_identifiers", true);
+
+  if (config.configfile)
+    yyjson_mut_obj_add_strcpy (doc, server, "config_file", config.configfile);
+  yyjson_mut_obj_add_int (doc, server, "verbose", config.verbose);
+
+  if (config.ringdir)
+    yyjson_mut_obj_add_strcpy (doc, server, "ring_directory", config.ringdir);
+  yyjson_mut_obj_add_uint (doc, server, "auto_recovery", config.autorecovery);
+
+  yyjson_mut_obj_add_uint (doc, server, "max_clients", config.maxclients);
+  yyjson_mut_obj_add_uint (doc, server, "max_clients_per_ip", config.maxclientsperip);
+  yyjson_mut_obj_add_uint (doc, server, "client_timeout", config.clienttimeout);
+  yyjson_mut_obj_add_uint (doc, server, "network_io_timeout", config.netiotimeout);
+  yyjson_mut_obj_add_uint (doc, server, "tcp_keepalive_idle", config.tcpkeepalive_idle);
+  yyjson_mut_obj_add_uint (doc, server, "tcp_keepalive_interval", config.tcpkeepalive_interval);
+  yyjson_mut_obj_add_uint (doc, server, "tcp_keepalive_count", config.tcpkeepalive_count);
+  yyjson_mut_obj_add_real (doc, server, "time_window_limit_percent", (double)config.timewinlimit);
+  yyjson_mut_obj_add_bool (doc, server, "resolve_hosts", config.resolvehosts);
+
+  if (config.webroot)
+    yyjson_mut_obj_add_strcpy (doc, server, "web_root", config.webroot);
+  if (config.httpheaders)
+    yyjson_mut_obj_add_strcpy (doc, server, "http_headers", config.httpheaders);
+
+  if (config.mseedarchive)
+  {
+    yyjson_mut_obj_add_strcpy (doc, server, "mseed_archive", config.mseedarchive);
+    yyjson_mut_obj_add_int (doc, server, "mseed_idle_timeout", config.mseedidleto);
+  }
+
+  if (config.tlscertfile)
+    yyjson_mut_obj_add_strcpy (doc, server, "tls_certificate_file", "<SET>");
+  if (config.tlskeyfile)
+    yyjson_mut_obj_add_strcpy (doc, server, "tls_key_file", "<SET>");
+
+  yyjson_mut_obj_add_bool (doc, server, "tls_verify_client_cert", config.tlsverifyclientcert);
+
+  /* Add auth object */
+  if ((auth = yyjson_mut_obj_add_obj (doc, server, "auth")) == NULL)
+  {
+    pthread_rwlock_unlock (&config.config_rwlock);
+    return NULL;
+  }
+  else
+  {
+    if (config.auth.program)
+    {
+      yyjson_mut_obj_add_strcpy (doc, auth, "program", "<SET>");
+      yyjson_mut_obj_add_uint (doc, auth, "timeout_sec", config.auth.timeout_sec);
+    }
+
+    yyjson_mut_obj_add_bool (doc, auth, "required", config.auth.required);
+  }
+
+  /* Add usage log object only when usage logging is enabled, which is
+   * controlled by the basedir being set (see logging.c gating). */
+  if (config.usagelog.basedir)
+  {
+    if ((ulog = yyjson_mut_obj_add_obj (doc, server, "usage_log")) == NULL ||
+        (modes = yyjson_mut_obj_add_arr (doc, ulog, "mode")) == NULL)
+    {
+      pthread_rwlock_unlock (&config.config_rwlock);
+      return NULL;
+    }
+
+    if (config.usagelog.mode & USAGELOG_JSONL)
+      yyjson_mut_arr_add_strcpy (doc, modes, "JSONL");
+    if (config.usagelog.mode & USAGELOG_RX)
+      yyjson_mut_arr_add_strcpy (doc, modes, "RX");
+    if (config.usagelog.mode & USAGELOG_TX)
+      yyjson_mut_arr_add_strcpy (doc, modes, "TX");
+    if (config.usagelog.mode & USAGELOG_ACCESS)
+      yyjson_mut_arr_add_strcpy (doc, modes, "ACCESS");
+
+    yyjson_mut_obj_add_strcpy (doc, ulog, "base_directory", config.usagelog.basedir);
+
+    if (config.usagelog.prefix)
+      yyjson_mut_obj_add_strcpy (doc, ulog, "prefix", config.usagelog.prefix);
+
+    yyjson_mut_obj_add_int (doc, ulog, "interval", config.usagelog.interval);
+
+    if (config.usagelog.startint > 0)
+    {
+      ms_nstime2timestr_n (MS_EPOCH2NSTIME (config.usagelog.startint),
+                           timestr, sizeof (timestr), ISOMONTHDAY_Z, NONE);
+      yyjson_mut_obj_add_strcpy (doc, ulog, "start_interval", timestr);
+    }
+
+    if (config.usagelog.endint > 0)
+    {
+      ms_nstime2timestr_n (MS_EPOCH2NSTIME (config.usagelog.endint),
+                           timestr, sizeof (timestr), ISOMONTHDAY_Z, NONE);
+      yyjson_mut_obj_add_strcpy (doc, ulog, "end_interval", timestr);
+    }
+  }
+
+  if (!add_ipnet_array (doc, server, "allowed_ips", config.allowedips, true) ||
+      !add_ipnet_array (doc, server, "forbidden_ips", config.forbiddenips, true) ||
+      !add_ipnet_array (doc, server, "accept_ips", config.acceptips, false) ||
+      !add_ipnet_array (doc, server, "deny_ips", config.denyips, false) ||
+      !add_ipnet_array (doc, server, "write_ips", config.writeips, false) ||
+      !add_ipnet_array (doc, server, "trusted_ips", config.trustedips, false))
+  {
+    pthread_rwlock_unlock (&config.config_rwlock);
+    return NULL;
+  }
+
+  pthread_rwlock_unlock (&config.config_rwlock);
+
+  yyjson_mut_obj_add_int (doc, server, "connection_count", param.clientcount);
+  yyjson_mut_obj_add_uint (doc, server, "stream_count", param.streamcount);
+  yyjson_mut_obj_add_real (doc, server, "transmit_packet_rate", param.txpacketrate);
+  yyjson_mut_obj_add_real (doc, server, "transmit_byte_rate", param.txbyterate);
+  yyjson_mut_obj_add_real (doc, server, "receive_packet_rate", param.rxpacketrate);
+  yyjson_mut_obj_add_real (doc, server, "receive_byte_rate", param.rxbyterate);
+
+  pktid = RingReadPacket (param.earliestoffset, &packet, NULL);
+  if (pktid != RINGID_NONE && pktid != RINGID_ERROR)
+  {
+    yyjson_mut_obj_add_uint (doc, server, "earliest_packet_id", pktid);
+    ms_nstime2timestr_n (packet.pkttime, timestr, sizeof (timestr), ISOMONTHDAY_Z, NANO_MICRO_NONE);
+    yyjson_mut_obj_add_strcpy (doc, server, "earliest_packet_time", timestr);
+    ms_nstime2timestr_n (packet.datastart, timestr, sizeof (timestr), ISOMONTHDAY_Z, NANO_MICRO_NONE);
+    yyjson_mut_obj_add_strcpy (doc, server, "earliest_data_start", timestr);
+    ms_nstime2timestr_n (packet.dataend, timestr, sizeof (timestr), ISOMONTHDAY_Z, NANO_MICRO_NONE);
+    yyjson_mut_obj_add_strcpy (doc, server, "earliest_data_end", timestr);
+  }
+
+  pktid = RingReadPacket (param.latestoffset, &packet, NULL);
+  if (pktid != RINGID_NONE && pktid != RINGID_ERROR)
+  {
+    yyjson_mut_obj_add_uint (doc, server, "latest_packet_id", pktid);
+    ms_nstime2timestr_n (packet.pkttime, timestr, sizeof (timestr), ISOMONTHDAY_Z, NANO_MICRO_NONE);
+    yyjson_mut_obj_add_strcpy (doc, server, "latest_packet_time", timestr);
+    ms_nstime2timestr_n (packet.datastart, timestr, sizeof (timestr), ISOMONTHDAY_Z, NANO_MICRO_NONE);
+    yyjson_mut_obj_add_strcpy (doc, server, "latest_data_start", timestr);
+    ms_nstime2timestr_n (packet.dataend, timestr, sizeof (timestr), ISOMONTHDAY_Z, NANO_MICRO_NONE);
+    yyjson_mut_obj_add_strcpy (doc, server, "latest_data_end", timestr);
+  }
+
+  /* List server threads, lock thread list while looping */
+  pthread_mutex_lock (&param.sthreads_lock);
+  for (loopstp = param.sthreads; loopstp != NULL; loopstp = loopstp->next)
+  {
+    thread = yyjson_mut_arr_add_obj (doc, thread_array);
+
+    /* Add thread state to Thread element */
+    if (loopstp->td->td_state == TDS_SPAWNING)
+      yyjson_mut_obj_add_strcpy (doc, thread, "state", "SPAWNING");
+    else if (loopstp->td->td_state == TDS_ACTIVE)
+      yyjson_mut_obj_add_strcpy (doc, thread, "state", "ACTIVE");
+    else if (loopstp->td->td_state == TDS_CLOSE)
+      yyjson_mut_obj_add_strcpy (doc, thread, "state", "CLOSE");
+    else if (loopstp->td->td_state == TDS_CLOSING)
+      yyjson_mut_obj_add_strcpy (doc, thread, "state", "CLOSING");
+    else if (loopstp->td->td_state == TDS_CLOSED)
+      yyjson_mut_obj_add_strcpy (doc, thread, "state", "CLOSED");
+    else
+      yyjson_mut_obj_add_strcpy (doc, thread, "state", "UNKNOWN");
+
+    /* Determine server thread type and add specifics */
+    if (loopstp->type == LISTEN_THREAD)
+    {
+      char protocolstr[100];
+      ListenPortParams *lpp = loopstp->params;
+
+      yyjson_mut_obj_add_strcpy (doc, thread, "type", "Listener");
+
+      if (GenProtocolString (lpp->protocols, lpp->options, protocolstr, sizeof (protocolstr)) > 0)
+      {
+        yyjson_mut_obj_add_strcpy (doc, thread, "protocol", protocolstr);
+      }
+
+      yyjson_mut_obj_add_strcpy (doc, thread, "port", lpp->portstr);
+    }
+    else if (loopstp->type == MSEEDSCAN_THREAD)
+    {
+      MSScanInfo *mssinfo = loopstp->params;
+
+      yyjson_mut_obj_add_strcpy (doc, thread, "type", "miniSEED scanner");
+      yyjson_mut_obj_add_strcpy (doc, thread, "directory", mssinfo->dirname);
+      yyjson_mut_obj_add_int (doc, thread, "max_recursion", mssinfo->maxrecur);
+      yyjson_mut_obj_add_strcpy (doc, thread, "state_file", mssinfo->statefile);
+      yyjson_mut_obj_add_strcpy (doc, thread, "match", mssinfo->matchstr);
+      yyjson_mut_obj_add_strcpy (doc, thread, "reject", mssinfo->rejectstr);
+      yyjson_mut_obj_add_real (doc, thread, "scan_time", mssinfo->scantime);
+      yyjson_mut_obj_add_real (doc, thread, "packet_rate", mssinfo->rxpacketrate);
+      yyjson_mut_obj_add_real (doc, thread, "byte_rate", mssinfo->rxbyterate);
+    }
+    else
+    {
+      yyjson_mut_obj_add_strcpy (doc, thread, "type", "Unknown");
+    }
+  }
+  pthread_mutex_unlock (&param.sthreads_lock);
+
+  return doc;
+}
+
+/***************************************************************************
+ * info_json:
+ *
+ * Return a JSON document with server details, conforming to the SeedLink
+ * v4 JSON info schema.
+ *
+ * Which elements are included is controlled by the elements bitmask.
+ *
+ * The returned string is minified JSON document and allocated on the heap
+ * that must be free'd by the caller.
+ *
+ * Returns pointer to JSON string on success and NULL on error.
+ ***************************************************************************/
+char *
+info_json (ClientInfo *cinfo, const char *software, InfoElements elements,
+           const char *matchexpr)
+{
+  yyjson_mut_doc *doc;
+
+  if (!cinfo)
+    return NULL;
+
+  if ((doc = info_create_root (software)) == NULL)
+  {
+    return NULL;
+  }
+
+  if (elements & INFO_ID &&
+      info_add_id (doc) == NULL)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  if (elements & INFO_CAPABILITIES &&
+      info_add_capabilities (doc) == NULL)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  if (elements & INFO_FORMATS &&
+      info_add_formats (doc) == NULL)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  if (elements & INFO_FILTERS &&
+      info_add_filters (doc) == NULL)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  if (elements & INFO_STATIONS &&
+      info_add_stations (cinfo, doc, 0, matchexpr) == NULL)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  if (elements & INFO_STATION_STREAMS &&
+      info_add_stations (cinfo, doc, 1, matchexpr) == NULL)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  if (elements & INFO_STREAMS &&
+      info_add_streams (cinfo, doc, matchexpr) == NULL)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  if (elements & INFO_CONNECTIONS &&
+      info_add_connections (cinfo, doc, matchexpr) == NULL)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  if (elements & INFO_STATUS &&
+      info_add_status (doc) == NULL)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  /* Generate JSON string, cleanup and return */
+  char *json_string = yyjson_mut_write (doc, 0, NULL);
+
+  yyjson_mut_doc_free (doc);
+
+  return json_string;
+}
+
+/***************************************************************************
+ * error_json:
+ *
+ * Return a JSON document with an error code and message, conforming to
+ * the SeedLink v4 JSON error schema.
+ *
+ * The returned string is minified JSON document and allocated on the heap
+ * that must be freed by the caller.
+ *
+ * Returns pointer to JSON strng on success and NULL on error.
+ ***************************************************************************/
+char *
+error_json (ClientInfo *cinfo, const char *software,
+            const char *code, const char *message)
+{
+  yyjson_mut_doc *doc;
+  yyjson_mut_val *root;
+  yyjson_mut_val *error;
+
+  if (!cinfo)
+    return NULL;
+
+  if ((doc = info_create_root (software)) == NULL)
+  {
+    return NULL;
+  }
+  root = yyjson_mut_doc_get_root (doc);
+
+  if ((error = yyjson_mut_obj_add_obj (doc, root, "error")) == NULL)
+  {
+    yyjson_mut_doc_free (doc);
+    return NULL;
+  }
+
+  yyjson_mut_obj_add_strcpy (doc, error, "code", code);
+  yyjson_mut_obj_add_strcpy (doc, error, "message", message);
+
+  char *json_string = yyjson_mut_write (doc, 0, NULL);
+
+  yyjson_mut_doc_free (doc);
+
+  return json_string;
+}

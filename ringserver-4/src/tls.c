@@ -1,0 +1,272 @@
+/**************************************************************************
+ * tls.c
+ *
+ * This file is part of the ringserver.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Copyright (C) 2026:
+ * @author Chad Trabant, EarthScope Data Services
+ **************************************************************************/
+
+#include <time.h>
+
+#include "tls.h"
+#include "logging.h"
+#include "ringserver.h"
+
+#define TLS_HANDSHAKE_TIMEOUT_MAX 30  /* Upper bound when netiotimeout is disabled */
+
+/* Debug output for TLS */
+void
+tls_debug (void *ctx, int level, const char *file, int line, const char *str)
+{
+  ((void)level);
+  ((void)ctx);
+
+  if (file == NULL)
+    file = "NULL";
+
+  if (str == NULL)
+    str = "NULL";
+
+  size_t len = strlen (str);
+
+  /* Avoid printing newline if included, lprintf() will add one */
+  if (len > 0 && str[len - 1] == '\n')
+    len--;
+
+  lprintf (0, "%s:%04d: %.*s", file, line, (int)len, str);
+}
+
+/***********************************************************************
+ *
+ * Initialize and negotiation TLS on connected client socket.
+ *
+ * Return 0 on success and non-zero on error.
+ ***********************************************************************/
+int
+TLSConfigure (ClientInfo *cinfo)
+{
+  TLSCTX *tlsctx = NULL;
+  char *evalue   = NULL;
+  char seedbuffer[256];
+  uint32_t flags;
+  int debug_level = 0;
+  int ret;
+
+  char tlscertfile[PATH_MAX] = {0};
+  char tlskeyfile[PATH_MAX]  = {0};
+
+  pthread_rwlock_rdlock (&config.config_rwlock);
+  if (config.tlscertfile)
+  {
+    strncpy (tlscertfile, config.tlscertfile, sizeof (tlscertfile) - 1);
+    tlscertfile[sizeof (tlscertfile) - 1] = '\0';
+  }
+  if (config.tlskeyfile)
+  {
+    strncpy (tlskeyfile, config.tlskeyfile, sizeof (tlskeyfile) - 1);
+    tlskeyfile[sizeof (tlskeyfile) - 1] = '\0';
+  }
+  pthread_rwlock_unlock (&config.config_rwlock);
+
+  if (tlscertfile[0] == '\0')
+  {
+    lprintf (0, "[%s] No TLS certificate provided, cannot configure TLS", cinfo->hostname);
+    return -1;
+  }
+
+  if (tlskeyfile[0] == '\0')
+  {
+    lprintf (0, "[%s] No TLS key provided, cannot configure TLS", cinfo->hostname);
+    return -1;
+  }
+
+  lprintf (2, "[%s] Configuring TLS", cinfo->hostname);
+
+  /* Allocate TLS data structure context */
+  if ((cinfo->tlsctx = malloc (sizeof (TLSCTX))) == NULL)
+  {
+    lprintf (0, "[%s] Cannot allocate memory for TLS context", cinfo->hostname);
+    return -1;
+  }
+
+  tlsctx = (TLSCTX *)cinfo->tlsctx;
+
+  /* Set debug level from environment variable if set */
+  if ((evalue = getenv ("RINGSERVER_TLS_DEBUG")) != NULL)
+  {
+    debug_level = (int)strtol (evalue, NULL, 10);
+    lprintf (1, "[%s] Configuring debug level %d (from RINGSERVER_TLS_DEBUG)",
+             cinfo->hostname, debug_level);
+
+    if (debug_level > 0)
+    {
+      mbedtls_debug_set_threshold (debug_level);
+    }
+  }
+
+  tlsctx->client_fd.fd = cinfo->socket;
+  mbedtls_ssl_init (&tlsctx->ssl);
+  mbedtls_ssl_config_init (&tlsctx->conf);
+  mbedtls_entropy_init (&tlsctx->entropy);
+  mbedtls_x509_crt_init (&tlsctx->srvcert);
+  mbedtls_pk_init (&tlsctx->pkey);
+  mbedtls_ctr_drbg_init (&tlsctx->ctr_drbg);
+
+  /* Seed the random number generator with hostname and thread ID as personalization */
+  snprintf (seedbuffer, sizeof (seedbuffer), "%s+%lu", cinfo->hostname, (unsigned long)pthread_self ());
+
+  if ((ret = mbedtls_ctr_drbg_seed (&tlsctx->ctr_drbg, mbedtls_entropy_func,
+                                    &tlsctx->entropy,
+                                    (const unsigned char *)seedbuffer,
+                                    strlen (seedbuffer))) != 0)
+  {
+    lprintf (0, "[%s] mbedtls_ctr_drbg_seed() returned %d (-0x%x)", cinfo->hostname, ret, (unsigned int)-ret);
+    return -1;
+  }
+
+  lprintf (2, "[%s] Reading TLS cert from '%s'", cinfo->hostname, tlscertfile);
+
+  if ((ret = mbedtls_x509_crt_parse_file (&tlsctx->srvcert, tlscertfile)) != 0)
+  {
+    lprintf (0, "[%s] mbedtls_x509_crt_parse_file() returned %d (-0x%x)", cinfo->hostname, ret, (unsigned int)-ret);
+    return -1;
+  }
+
+  lprintf (2, "[%s] Reading TLS key from '%s'", cinfo->hostname, tlskeyfile);
+
+  if ((ret = mbedtls_pk_parse_keyfile (&tlsctx->pkey, tlskeyfile, "",
+                                       mbedtls_ctr_drbg_random, &tlsctx->ctr_drbg)) != 0)
+  {
+    lprintf (0, "[%s] mbedtls_pk_parse_keyfile() returned %d (-0x%x)", cinfo->hostname, ret, (unsigned int)-ret);
+    return -1;
+  }
+
+  if ((ret = mbedtls_ssl_config_defaults (&tlsctx->conf,
+                                          MBEDTLS_SSL_IS_SERVER,
+                                          MBEDTLS_SSL_TRANSPORT_STREAM,
+                                          MBEDTLS_SSL_PRESET_DEFAULT)) != 0)
+  {
+    lprintf (0, "[%s] mbedtls_ssl_config_defaults() returned %d", cinfo->hostname, ret);
+    return -1;
+  }
+
+  mbedtls_ssl_conf_authmode (&tlsctx->conf,
+                             config.tlsverifyclientcert ? MBEDTLS_SSL_VERIFY_OPTIONAL
+                                                       : MBEDTLS_SSL_VERIFY_NONE);
+  mbedtls_ssl_conf_rng (&tlsctx->conf, mbedtls_ctr_drbg_random, &tlsctx->ctr_drbg);
+  mbedtls_ssl_conf_dbg (&tlsctx->conf, tls_debug, NULL);
+
+  mbedtls_ssl_conf_ca_chain (&tlsctx->conf, &tlsctx->srvcert, NULL);
+
+  if ((ret = mbedtls_ssl_conf_own_cert (&tlsctx->conf, &tlsctx->srvcert, &tlsctx->pkey)) != 0)
+  {
+    lprintf (0, "[%s] mbedtls_ssl_conf_own_cert() returned %d", cinfo->hostname, ret);
+    return -1;
+  }
+
+  if ((ret = mbedtls_ssl_setup (&tlsctx->ssl, &tlsctx->conf)) != 0)
+  {
+    lprintf (0, "[%s] mbedtls_ssl_setup() returned %d", cinfo->hostname, ret);
+    return -1;
+  }
+
+  mbedtls_ssl_set_bio (&tlsctx->ssl, &tlsctx->client_fd,
+                       mbedtls_net_send, mbedtls_net_recv, NULL);
+
+  lprintf (2, "[%s] Starting TLS handshake", cinfo->hostname);
+
+  /* Cap the handshake duration to the configured network I/O timeout so
+   * a slow-handshake DoS cannot pin a thread for longer than any other
+   * idle client. Fall back to TLS_HANDSHAKE_TIMEOUT_MAX when the
+   * operator has disabled netiotimeout. */
+  time_t handshake_start   = time (NULL);
+  time_t handshake_timeout = (config.netiotimeout > 0)
+                                 ? (time_t)config.netiotimeout
+                                 : TLS_HANDSHAKE_TIMEOUT_MAX;
+
+  while ((ret = mbedtls_ssl_handshake (&tlsctx->ssl)) != 0)
+  {
+    if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+        ret != MBEDTLS_ERR_SSL_WANT_WRITE &&
+        ret != MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS)
+    {
+      lprintf (0, "[%s] mbedtls_ssl_handshake() returned -0x%x", cinfo->hostname, (unsigned int)-ret);
+      return -1;
+    }
+
+    if (param.shutdownsig)
+    {
+      lprintf (1, "[%s] TLS handshake interrupted by shutdown", cinfo->hostname);
+      return -1;
+    }
+
+    if (time (NULL) - handshake_start > handshake_timeout)
+    {
+      lprintf (0, "[%s] TLS handshake timed out after %ld seconds",
+               cinfo->hostname, (long)handshake_timeout);
+      return -1;
+    }
+
+    /* Wait for socket availability for 1 second */
+    PollSocket (cinfo->socket, 1, 1, 1000);
+  }
+
+  if (config.tlsverifyclientcert)
+  {
+    lprintf (2, "[%s] Verifying TLS client certificate", cinfo->hostname);
+
+    if ((flags = mbedtls_ssl_get_verify_result (&tlsctx->ssl)) != 0)
+    {
+      char vrfy_buf[512];
+      lprintf (0, "[%s] Certificate verification failed", cinfo->hostname);
+
+      mbedtls_x509_crt_verify_info (vrfy_buf, sizeof (vrfy_buf), "  ! ", flags);
+      lprintf (0, "[%s] VERIFY INFO: %s", cinfo->hostname, vrfy_buf);
+
+      lprintf (0, "[%s] Connection refused due to client certificate verification failure", cinfo->hostname);
+
+      return -1;
+    }
+  }
+
+  lprintf (1, "[%s] TLS connection established", cinfo->hostname);
+
+  return 0;
+} /* End of TLSConfigure() */
+
+/***********************************************************************
+ *
+ * Free memory allocated for TLS connections
+ *
+ ***********************************************************************/
+void
+TLSCleanup (ClientInfo *cinfo)
+{
+  if (cinfo->tlsctx)
+  {
+    TLSCTX *tlsctx = (TLSCTX *)cinfo->tlsctx;
+
+    mbedtls_ssl_free (&tlsctx->ssl);
+    mbedtls_ssl_config_free (&tlsctx->conf);
+    mbedtls_entropy_free (&tlsctx->entropy);
+    mbedtls_x509_crt_free (&tlsctx->srvcert);
+    mbedtls_pk_free (&tlsctx->pkey);
+    mbedtls_ctr_drbg_free (&tlsctx->ctr_drbg);
+
+    free (cinfo->tlsctx);
+    cinfo->tlsctx = NULL;
+  }
+}

@@ -1,0 +1,358 @@
+#include <tau/tau.h>
+#include <libmseed.h>
+#include <time.h>
+
+/* This test reads a miniSEED file directly into a MS3TraceList and verifies the
+ * contents of the trace list against expected values.
+ *
+ * The test data is a miniSEED file with one series of data with mixed lengths
+ * and mixed time order.
+ *
+ * The test verifies basic functionality of reading data from files of miniSEED
+ * into a trace list and that data added to the trace list are reconstructed as a
+ * continuous time series, regardless of the order in which the data are added.
+ */
+TEST (tracelist, ms3_readtracelist_mixedlengths_mixedorder)
+{
+  MS3TraceList *mstl = NULL;
+  MS3TraceID *id     = NULL;
+  nstime_t starttime;
+  nstime_t endtime;
+  uint32_t flags = 0;
+  int rv;
+
+  char *path = "data/testdata-oneseries-mixedlengths-mixedorder.mseed2";
+
+  starttime = ms_timestr2nstime ("2010-02-27T06:50:00.069539Z");
+  endtime = ms_timestr2nstime ("2010-02-27T07:55:51.069539Z");
+
+  flags = MSF_UNPACKDATA;
+  rv = ms3_readtracelist (&mstl, path, NULL, 0, flags, 0);
+
+  CHECK (rv == MS_NOERROR, "ms3_readtracelist() did not return expected MS_NOERROR");
+  REQUIRE (mstl != NULL, "ms3_readtracelist() did not populate 'mstl'");
+  CHECK (mstl->numtraceids == 1, "mstl->numtraceids is not expected 1");
+
+  id = mstl->traces.next[0];
+
+  REQUIRE (id != NULL, "mstl->traces.next[0] is not populated");
+  REQUIRE (id->first != NULL, "id->first is not populated");
+  CHECK_STREQ (id->sid, "FDSN:XX_TEST_00_L_H_Z");
+  CHECK (id->earliest == starttime, "Earliest time is not expected '2010-02-27T06:50:00.069539Z'");
+  CHECK (id->latest == endtime, "Latest time is not expected '2010-02-27T07:55:51.069539Z'");
+  CHECK (id->pubversion == 1, "id->pubversion is not expected 1");
+  CHECK (id->numsegments == 1, "id->numsegments is not expected 1");
+  CHECK (id->first->starttime == starttime, "Segment start is not expected '2010-02-27T06:50:00.069539Z'");
+  CHECK (id->first->endtime == endtime, "Segment start is not expected '2010-02-27T07:55:51.069539Z'");
+  CHECK (id->first->samplecnt == 3952, "id->first->samplecnt is not expected 3952");
+  CHECK (id->first->sampletype == 'i', "id->first->sampletype is not expected 'i'");
+  CHECK (id->first->numsamples == 3952, "id->first->numsamples is not expected 3952");
+  CHECK (id->next[0] == NULL, "id->next[0] is not expected NULL");
+  CHECK (id->first->next == NULL, "id->first->next is not expected NULL");
+  CHECK (id->first == id->last, "id->first is not equal to id->last as expected");
+
+  mstl3_free (&mstl, 1);
+}
+
+/* This test reads a miniSEED file directly into a MS3TraceList while using the
+ * MSF_RECORDLIST flag to build a record list for each trace segment.  The
+ * expected contents of the record list are verified.
+ */
+TEST (tracelist, ms3_readtracelist_recptr)
+{
+  MS3TraceList *mstl   = NULL;
+  MS3TraceID *id       = NULL;
+  MS3RecordPtr *recptr = NULL;
+  nstime_t endtime;
+  int64_t unpacked;
+  uint32_t flags = 0;
+  int32_t *int32s;
+  int rv;
+
+  char *path = "data/testdata-oneseries-mixedlengths-mixedorder.mseed2";
+
+  endtime = ms_timestr2nstime ("2010-02-27T07:55:51.069539Z");
+
+  /* Set bit flag to build a record list */
+  flags = MSF_RECORDLIST;
+
+  rv = ms3_readtracelist (&mstl, path, NULL, 0, flags, 0);
+
+  CHECK (rv == MS_NOERROR, "ms3_readtracelist() did not return expected MS_NOERROR");
+  REQUIRE (mstl != NULL, "ms3_readtracelist() did not populate 'mstl'");
+  CHECK (mstl->numtraceids == 1, "mstl->numtraceids is not expected 1");
+
+  id = mstl->traces.next[0];
+
+  REQUIRE (id != NULL, "mstl->traces.next[0] is not populated");
+  REQUIRE (id->first != NULL, "id->first is not populated");
+  REQUIRE (id->first->recordlist != NULL, "id->first->recordlist is not populated");
+  CHECK (id->first->samplecnt == 3952, "id->first->samplecnt is not expected 3952");
+
+  /* No data has been decoded */
+  CHECK (id->first->sampletype == 0, "id->first->sampletype is not expected 0");
+  CHECK (id->first->datasamples == NULL, "id->first->datasamples is not expected NULL");
+  CHECK (id->first->numsamples == 0, "id->first->numsamples is not expected 0");
+
+  recptr = id->first->recordlist->last;
+  CHECK (recptr->filename != NULL, "recptr->filename is unexpected NULL");     /* Record is in a file */
+  CHECK (recptr->bufferptr == NULL, "recptr->bufferptr is not expected NULL"); /* Record is not in a buffer */
+  CHECK (recptr->fileptr == NULL, "recptr->fileptr is not expected NULL");     /* File is not currently open, closed by read routine */
+  CHECK (recptr->fileoffset == 1152, "recptr->fileoffset is not expected 1152");
+  CHECK (recptr->msr != NULL, "recptr->msr is not expected NULL");
+  CHECK (recptr->endtime == endtime, "recptr->endtime is not expected '2010-02-27T07:55:51.069539Z'");
+  CHECK (recptr->dataoffset == 64, "recptr->dataoffset is not expected 64");
+  CHECK (recptr->next == NULL, "recptr->next is not exected NULL");
+
+  /* Decode data */
+  unpacked = mstl3_unpack_recordlist (id, id->first, NULL, 0, 0);
+
+  CHECK (unpacked == id->first->samplecnt, "Return from mstl3_unpack_recordlist is not expected id->first->samplecnt");
+  CHECK (id->first->sampletype == 'i', "id->first->sampletype is not expected 'i'");
+  CHECK (id->first->datasamples != NULL, "id->first->datasamples is unexpected NULL");
+  CHECK (id->first->numsamples == 3952, "id->first->numsamples is not expected 3952");
+
+  int32s = (int32_t *)id->first->datasamples;
+  CHECK (int32s[3948] == 28067, "Decoded sample value mismatch");
+  CHECK (int32s[3949] == -9565, "Decoded sample value mismatch");
+  CHECK (int32s[3950] == -71961, "Decoded sample value mismatch");
+  CHECK (int32s[3951] == -146622, "Decoded sample value mismatch");
+
+  mstl3_free (&mstl, 1);
+}
+
+/* This test reads miniSEED from a buffer into a MS3TraceList while using the
+ * MSF_RECORDLIST flag to build a record list for each trace segment.  The
+ * expected contents of the record list are verified.
+ */
+TEST (tracelist, mstl3_readbuffer_recptr)
+{
+  char buffer[16256];
+  FILE *fp = NULL;
+
+  MS3TraceList *mstl = NULL;
+  MS3TraceID *id = NULL;
+  MS3RecordPtr *recptr = NULL;
+  nstime_t endtime;
+  int64_t unpacked;
+  uint32_t flags = 0;
+  int32_t *int32s;
+  size_t rv;
+
+  char *path = "data/testdata-oneseries-mixedlengths-mixedorder.mseed2";
+
+  /* Read test data into buffer */
+  fp = fopen (path, "rb");
+  REQUIRE (fp != NULL, "File pointer is unexpected NULL");
+
+  rv = fread (buffer, sizeof(buffer), 1, fp);
+  REQUIRE (rv == 1, "fread() did not read entire file");
+
+  fclose (fp);
+
+  endtime = ms_timestr2nstime ("2010-02-27T07:55:51.069539Z");
+
+  /* Set bit flag to build a record list */
+  flags = MSF_RECORDLIST;
+
+  rv = mstl3_readbuffer (&mstl, buffer, sizeof(buffer), 0, flags, 0, 0);
+
+  CHECK (rv == 7, "mstl3_readbuffer did not return expected 7");
+  CHECK (mstl != NULL, "mstl3_readbuffer did not populate 'mstl'");
+  CHECK (mstl->numtraceids == 1, "mstl->numtraceids is not expected 1");
+
+  id = mstl->traces.next[0];
+
+  REQUIRE (id != NULL, "mstl->traces.next[0] is not populated");
+  REQUIRE (id->first != NULL, "id->first is unexpected NULL");
+  REQUIRE (id->first->recordlist, "id->first->recordlist is unexpected NULL");
+  CHECK (id->first->samplecnt == 3952, "id->first->samplecnt is not expected 3952");
+
+  /* No data has been decoded */
+  CHECK (id->first->sampletype == 0, "id->first->sampletype is not expected 0");
+  CHECK (id->first->datasamples == NULL, "id->first->datasamples is unexpected NULL");
+  CHECK (id->first->numsamples == 0, "id->first->numsamples is not expected 0");
+
+  recptr = id->first->recordlist->last;
+  CHECK (recptr != NULL, "id->first->recordlist->last is unexpected NULL");
+  CHECK (recptr->filename == NULL, "recptr->filename is not expected NULL"); /* Record is not in a file */
+  CHECK (recptr->bufferptr != NULL, "recptr->bufferptr is unexpected NULL"); /* Record is in a buffer */
+  CHECK (recptr->fileptr == NULL, "recptr->fileptr is not expected NULL");   /* File is not currently open, closed by read routine */
+
+  CHECK (recptr->fileoffset == 0, "recptr->fileoffset is not expected 0");
+  CHECK (recptr->msr != NULL, "recptr->msr is not expected NULL");
+  CHECK (recptr->endtime == endtime, "recptr->endtime is not expected '2010-02-27T07:55:51.069539Z'");
+  CHECK (recptr->dataoffset == 64, "recptr->dataoffset is not expected 64");
+  CHECK (recptr->next == NULL, "recptr->next is not expected NULL");
+
+  /* Decode data */
+  unpacked = mstl3_unpack_recordlist (id, id->first, NULL, 0, 0);
+
+  CHECK (unpacked == id->first->samplecnt, "Return from mstl3_unpack_recordlist is not expected id->first->samplecnt");
+  CHECK (id->first->sampletype == 'i', "id->first->sampletype is not expected 'i'");
+  CHECK (id->first->datasamples != NULL, "id->first->datasamples is unexpected NULL");
+  CHECK (id->first->numsamples == 3952, "id->first->numsamples is not expected 3952");
+
+  int32s = (int32_t *)id->first->datasamples;
+  CHECK (int32s[3948] == 28067, "Decoded sample value mismatch");
+  CHECK (int32s[3949] == -9565, "Decoded sample value mismatch");
+  CHECK (int32s[3950] == -71961, "Decoded sample value mismatch");
+  CHECK (int32s[3951] == -146622, "Decoded sample value mismatch");
+
+  mstl3_free (&mstl, 1);
+}
+
+/* This test reads miniSEED from a file into a MS3TraceList while using the
+ * MSF_PPUPDATETIME flag to set the segment prvtptr to the update time of the
+ * record.  The expected value of the segment prvtptr is verified to be within
+ * 10 seconds of the system time.
+ */
+TEST (tracelist, ms3_readtracelist_ppupdatetime)
+{
+  MS3TraceList *mstl = NULL;
+  MS3TraceID *id = NULL;
+  uint32_t flags;
+  nstime_t difference;
+  time_t timeval;
+  int rv;
+
+  char *path = "data/testdata-oneseries-mixedlengths-mixedorder.mseed2";
+
+  timeval = time (NULL);
+
+  /* Set bit flag to set segment prvtptr to nstime_t value of update time */
+  flags = MSF_PPUPDATETIME;
+
+  rv = ms3_readtracelist (&mstl, path, NULL, 0, flags, 0);
+
+  CHECK (rv == MS_NOERROR, "ms3_readtracelist() did not return expected MS_NOERROR");
+  REQUIRE (mstl != NULL, "ms3_readtracelist() did not populate 'mstl'");
+  CHECK (mstl->numtraceids == 1, "mstl->numtraceids is not expected 1");
+
+  id = mstl->traces.next[0];
+
+  REQUIRE (id != NULL, "mstl->traces.next[0] is not populated");
+  REQUIRE (id->first != NULL, "id->first is not populated");
+
+  CHECK (id->first->prvtptr != NULL, "id->first->prvtptr is not populated");
+
+  /* Check that update time is within 10 seconds of system time */
+  difference = *(nstime_t *)id->first->prvtptr - (nstime_t)timeval * NSTMODULUS;
+
+  CHECK (difference < (nstime_t)10 * (nstime_t)NSTMODULUS,
+         "update time at id->first->prvtptr is not within 10 seconds of system time");
+
+  mstl3_free (&mstl, 1);
+}
+
+/* This test reads miniSEED from a file into a MS3TraceList while using the
+ * MSF_SPLITISVERSION flag to use the value of splitversion as the version
+ * instead of the record publication version.  The expected value of the trace
+ * ID's version is verified.
+ */
+TEST (tracelist, ms3_readtracelist_splitisversion)
+{
+  MS3TraceList *mstl = NULL;
+  MS3TraceID *id = NULL;
+  uint32_t flags;
+  int rv;
+
+  char *path = "data/testdata-oneseries-mixedlengths-mixedorder.mseed3";
+
+  /* Set bit flag to use the value of splitversion as the version
+   * instead of the record publication version. */
+  flags = MSF_SPLITISVERSION;
+
+  rv = ms3_readtracelist (&mstl, path, NULL, 99, flags, 0);
+
+  CHECK (rv == MS_NOERROR, "ms3_readtracelist() did not return expected MS_NOERROR");
+  REQUIRE (mstl != NULL, "ms3_readtracelist() did not populate 'mstl'");
+  CHECK (mstl->numtraceids == 1, "mstl->numtraceids is not expected 1");
+
+  id = mstl->traces.next[0];
+
+  REQUIRE (id != NULL, "mstl->traces.next[0] is not populated");
+
+  CHECK (id->pubversion == 99, "id->pubversion is not expected 99");
+
+  mstl3_free (&mstl, 1);
+}
+
+/* Build a trace list from two time-contiguous, header-only records for the same
+ * source whose sample rates are specified as parameters and return the resulting number
+ * of segments. */
+static int
+addmsr_two_rates (const MS3Tolerance *tolerance, double samprate1, double samprate2)
+{
+  MS3TraceList *mstl = NULL;
+  MS3Record msr = MS3Record_INITIALIZER;
+  nstime_t endtime1;
+  int numsegments;
+
+  if (!(mstl = mstl3_init (NULL)))
+    return -1;
+
+  strcpy (msr.sid, "FDSN:XX_TEST__X_H_Z");
+  msr.formatversion = 3;
+  msr.pubversion = 1;
+  msr.sampletype = 'i';
+  msr.samplecnt = 100;
+  msr.numsamples = 0; /* Header-only, no decoded samples needed for merge logic */
+  msr.datasamples = NULL;
+
+  /* Record 1 at samprate1 */
+  msr.starttime = ms_timestr2nstime ("2024-01-01T00:00:00.0Z");
+  msr.samprate = samprate1;
+  endtime1 = msr3_endtime (&msr);
+
+  if (!mstl3_addmsr (mstl, &msr, 0, 1, 0, tolerance))
+  {
+    mstl3_free (&mstl, 0);
+    return -1;
+  }
+
+  /* Record 2 at samprate2, starting exactly one (record 2) sample period after
+   * record 1 ends, so the records are time-contiguous regardless of rate. */
+  msr.samprate = samprate2;
+  msr.starttime = endtime1 + msr3_nsperiod (&msr);
+
+  if (!mstl3_addmsr (mstl, &msr, 0, 1, 0, tolerance))
+  {
+    mstl3_free (&mstl, 0);
+    return -1;
+  }
+
+  numsegments = (mstl->traces.next[0]) ? (int)mstl->traces.next[0]->numsegments : -1;
+
+  mstl3_free (&mstl, 0);
+  return numsegments;
+}
+
+/* Verify sample rate tolerance handling in mstl3_addmsr() for default tolerance.  Two
+ * time-contiguous records whose sample rates differ beyond the default
+ * tolerance must remain separate segments when the default tolerance is used. */
+TEST (tracelist, mstl3_addmsr_sampratetol_default)
+{
+  CHECK (addmsr_two_rates (NULL, 100.0, 99.5) == 2,
+         "Differing sample rates with default tolerance did not yield 2 segments");
+}
+
+/* A sample rate tolerance callback for mstl3_addmsr() that considers any two
+ * sample rates within 1.0 Hz of each other to be the same. */
+static double
+samprate_tol_generous (const MS3Record *msr)
+{
+  (void)msr;
+  return 1.0;
+}
+
+/* Verify that supplying a custom (generous) sample rate tolerance causes the same
+ * two records to be considered similar and merged into a single segment. */
+TEST (tracelist, mstl3_addmsr_sampratetol_custom)
+{
+  MS3Tolerance tolerance = MS3Tolerance_INITIALIZER;
+  tolerance.samprate = samprate_tol_generous;
+
+  CHECK (addmsr_two_rates (&tolerance, 100.0, 99.5) == 1,
+         "Differing sample rates with generous custom tolerance did not merge into 1 segment");
+}
