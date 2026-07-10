@@ -32,6 +32,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include "clients.h"
@@ -388,9 +389,16 @@ ClientThread (void *arg)
       {
         break;
       }
-      if (sentbytes == 0) /* No packet sent, maximum throttle immediately */
+      if (sentbytes == 0) /* No packet available — exponential backoff */
       {
-        throttle_msec = THROTTLE_MAXIMUM;
+        /* Double the throttle up to MAXIMUM each empty iteration instead of
+         * jumping directly to MAXIMUM.  This keeps latency low on bursty rings:
+         * first empty poll → 5 ms, next → 10 ms → 20 ms → 40 ms → 50 ms cap.
+         * A burst arriving after the first empty poll is served within 5 ms. */
+        if (throttle_msec < THROTTLE_STEPPING)
+          throttle_msec = THROTTLE_STEPPING;
+        else
+          throttle_msec = (throttle_msec * 2 < THROTTLE_MAXIMUM) ? throttle_msec * 2 : THROTTLE_MAXIMUM;
       }
       else /* If packet sent do not throttle */
       {
@@ -829,7 +837,113 @@ SendDataMB (ClientInfo *cinfo, void *buffer[], size_t buflen[],
     bufcount++;
   }
 
-  /* Send each buffer in sequence */
+  /* Fast path: non-TLS plain socket — use writev() to send all buffers in
+   * a single syscall.  This eliminates per-buffer send() overhead which is
+   * critical when each SeedLink record arrives as two pieces (header + payload).
+   * writev() lets the kernel combine them into one TCP segment, reducing both
+   * syscall count and small-packet fragmentation at high client counts. */
+  if (!cinfo->tlsctx)
+  {
+    /* Build iovec array on the stack; MAX_REPLACEMENT_LIST_LENGTH is ≤ 10 */
+    struct iovec iov[MAX_REPLACEMENT_LIST_LENGTH];
+    for (idx = 0; idx < bufcount; idx++)
+    {
+      iov[idx].iov_base = buffer[idx];
+      iov[idx].iov_len  = buflen[idx];
+    }
+
+    size_t total_written = 0;
+    int iov_offset       = 0; /* index of first unsent iov */
+
+    while (total_written < totalbuflen)
+    {
+      ssize_t wv = writev (cinfo->socket, iov + iov_offset, bufcount - iov_offset);
+
+      if (wv > 0)
+      {
+        total_written += (size_t)wv;
+        /* Advance iov_offset past fully-sent iovecs */
+        size_t rem = (size_t)wv;
+        while (iov_offset < bufcount && rem >= iov[iov_offset].iov_len)
+        {
+          rem -= iov[iov_offset].iov_len;
+          iov_offset++;
+        }
+        if (rem > 0 && iov_offset < bufcount)
+        {
+          /* Partial send inside one iovec — adjust base and length */
+          iov[iov_offset].iov_base = (char *)iov[iov_offset].iov_base + rem;
+          iov[iov_offset].iov_len -= rem;
+        }
+        nsent = (int)wv;
+      }
+      else if (wv == 0)
+      {
+        nsent = 0;
+        break;
+      }
+      else /* wv < 0 */
+      {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+          pollret = PollSocket (cinfo->socket, 0, 1, config.netiotimeout * 1000);
+          if (pollret == 0)
+          {
+            if (param.shutdownsig == 0)
+            {
+              lprintf (0, "[%s] Timeout sending data", cinfo->hostname);
+              cinfo->socketerr = -1;
+              return -1;
+            }
+            else
+            {
+              cinfo->socketerr = -2;
+              return -2;
+            }
+          }
+          else if (pollret == -1 && errno != EINTR)
+          {
+            lprintf (0, "[%s] Error polling socket", cinfo->hostname);
+            cinfo->socketerr = -1;
+            return -1;
+          }
+          nsent = 1; /* allow outer while to retry */
+        }
+        else
+        {
+          nsent = -1;
+          break;
+        }
+      }
+    }
+
+    /* Translate nsent state to error checks below */
+    if (nsent == 0)
+    {
+      lprintf (0, "[%s] Error sending data: writev returned 0", cinfo->hostname);
+      cinfo->socketerr = -1;
+      return -1;
+    }
+    else if (nsent < 0)
+    {
+      if (errno == EPIPE || errno == ECONNRESET)
+      {
+        cinfo->socketerr = -2;
+        return -2;
+      }
+      lprintf (0, "[%s] Error sending data via writev", cinfo->hostname);
+      cinfo->socketerr = -1;
+      return -1;
+    }
+
+    /* Update the time of the last packet exchange */
+    cinfo->lastxchange = NSnow ();
+
+    return 0;
+  }
+
+  /* Slow path: TLS — must go through mbedtls which does not support iovec.
+   * Send each buffer in sequence as before. */
   for (idx = 0; idx < bufcount; idx++)
   {
     /* Loop until entire buffer has been sent, polling socket as needed */
@@ -837,72 +951,35 @@ SendDataMB (ClientInfo *cinfo, void *buffer[], size_t buflen[],
          written < buflen[idx] && nsent >= 0;
          written += nsent)
     {
-      if (cinfo->tlsctx)
+      while ((nsent = mbedtls_ssl_write (&tlsctx->ssl, (unsigned char *)buffer[idx] + written, buflen[idx] - written)) <= 0)
       {
-        while ((nsent = mbedtls_ssl_write (&tlsctx->ssl, (unsigned char *)buffer[idx] + written, buflen[idx] - written)) <= 0)
-        {
-          pollret = 1;
-          if (nsent == MBEDTLS_ERR_SSL_WANT_READ)
-            pollret = PollSocket (cinfo->socket, 1, 0, config.netiotimeout * 1000);
-          else if (nsent == MBEDTLS_ERR_SSL_WANT_WRITE)
-            pollret = PollSocket (cinfo->socket, 0, 1, config.netiotimeout * 1000);
-          else
-            break;
+        pollret = 1;
+        if (nsent == MBEDTLS_ERR_SSL_WANT_READ)
+          pollret = PollSocket (cinfo->socket, 1, 0, config.netiotimeout * 1000);
+        else if (nsent == MBEDTLS_ERR_SSL_WANT_WRITE)
+          pollret = PollSocket (cinfo->socket, 0, 1, config.netiotimeout * 1000);
+        else
+          break;
 
-          if (pollret == 0)
+        if (pollret == 0)
+        {
+          if (param.shutdownsig == 0)
           {
-            if (param.shutdownsig == 0)
-            {
-              lprintf (0, "[%s] Timeout sending data", cinfo->hostname);
-              cinfo->socketerr = -1;
-              return -1;
-            }
-            else /* Indicate an orderly shutdown */
-            {
-              cinfo->socketerr = -2;
-              return -2;
-            }
-          }
-          else if (pollret == -1 && errno != EINTR)
-          {
-            lprintf (0, "[%s] Error polling socket", cinfo->hostname);
+            lprintf (0, "[%s] Timeout sending data", cinfo->hostname);
             cinfo->socketerr = -1;
             return -1;
+          }
+          else
+          {
+            cinfo->socketerr = -2;
+            return -2;
           }
         }
-      }
-      else
-      {
-        while ((nsent = send (cinfo->socket, (unsigned char *)buffer[idx] + written, buflen[idx] - written, 0)) <= 0)
+        else if (pollret == -1 && errno != EINTR)
         {
-          pollret = 1;
-          if (nsent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
-            pollret = PollSocket (cinfo->socket, 0, 1, config.netiotimeout * 1000);
-          else if (nsent < 0)
-            break;
-          else if (nsent == 0)
-            break; /* No progress, avoid infinite loop */
-
-          if (pollret == 0)
-          {
-            if (param.shutdownsig == 0)
-            {
-              lprintf (0, "[%s] Timeout sending data", cinfo->hostname);
-              cinfo->socketerr = -1;
-              return -1;
-            }
-            else /* Indicate an orderly shutdown */
-            {
-              cinfo->socketerr = -2;
-              return -2;
-            }
-          }
-          else if (pollret == -1 && errno != EINTR)
-          {
-            lprintf (0, "[%s] Error polling socket", cinfo->hostname);
-            cinfo->socketerr = -1;
-            return -1;
-          }
+          lprintf (0, "[%s] Error polling socket", cinfo->hostname);
+          cinfo->socketerr = -1;
+          return -1;
         }
       }
     }

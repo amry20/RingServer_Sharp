@@ -1004,13 +1004,14 @@ ListenThread (void *arg)
     }
 
     /* Tune socket send/receive buffers for high-throughput SeedLink streaming.
-     * 256 KiB send buffer: enough to hold ~50 typical 512-byte miniSEED records
-     * in flight without blocking the client thread, even at 1000+ clients.
-     * 64 KiB receive buffer: SeedLink clients send very few commands; small is fine.
-     * These are hints; the kernel may clamp them to net.core.{w,r}mem_max. */
+     * 1 MiB send buffer: accommodates bursts of many 512-byte miniSEED records
+     * queued per client without blocking the client thread, even at 1000+ clients.
+     * 128 KiB receive buffer: SeedLink clients send very few bytes (commands only).
+     * These are hints; the kernel may clamp them to net.core.{w,r}mem_max.
+     * Recommended sysctl: net.core.wmem_max=4194304 net.core.rmem_max=524288 */
     {
-      int sndbuf = 256 * 1024;
-      int rcvbuf = 64  * 1024;
+      int sndbuf = 1024 * 1024;
+      int rcvbuf = 128  * 1024;
       if (setsockopt (clientsocket, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof (sndbuf)))
         lprintf (2, "[%s] setsockopt(SO_SNDBUF): %s", ipstr, strerror (errno));
       if (setsockopt (clientsocket, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof (rcvbuf)))

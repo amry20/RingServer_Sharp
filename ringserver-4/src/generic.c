@@ -202,10 +202,16 @@ NSnow (void)
 {
   struct timespec ts;
 
-  /* clock_gettime(CLOCK_REALTIME) is POSIX, faster than gettimeofday() on
-   * modern kernels (vDSO path), and returns nanosecond resolution directly
-   * without the microsecond-to-nanosecond multiplication overhead. */
+  /* CLOCK_REALTIME_COARSE (Linux): reads from a kernel-maintained variable
+   * updated at HZ frequency (~4 ms resolution) without a full syscall.
+   * This is the fastest timestamp source available and sufficient for
+   * SeedLink throttle, timeout, and keepalive bookkeeping.
+   * Fall back to CLOCK_REALTIME on non-Linux or older kernels. */
+#if defined(CLOCK_REALTIME_COARSE)
+  if (clock_gettime (CLOCK_REALTIME_COARSE, &ts))
+#else
   if (clock_gettime (CLOCK_REALTIME, &ts))
+#endif
   {
     lprintf (0, "%s(): error with clock_gettime()", __func__);
     return NSTERROR;
