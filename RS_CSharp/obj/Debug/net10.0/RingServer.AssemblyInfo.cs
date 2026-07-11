@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("RingServer")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+d51b63c4a412994eed657005df00650765bb9c2c")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+852c5bd69135813ca0bd7eacf267ba118e801d64")]
 [assembly: System.Reflection.AssemblyProductAttribute("RingServer")]
 [assembly: System.Reflection.AssemblyTitleAttribute("RingServer")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
